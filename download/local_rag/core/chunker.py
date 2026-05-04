@@ -33,11 +33,13 @@ class TextChunker:
             logger.warning("tiktoken 加载失败，将使用字符数估算 token 数")
 
     def count_tokens(self, text: str) -> int:
-        """计算文本的 token 数"""
+        """计算文本的 token 数（中文优化）"""
         if self._tokenizer:
             return len(self._tokenizer.encode(text))
-        # 粗略估算：中文约 1.5 字符/token，英文约 4 字符/token
-        return int(len(text) / 2.5)
+        # 中文约 1.5 字符/token，英文约 4 字符/token，混合取 2
+        chinese_count = len(re.findall(r'[\u4e00-\u9fff]', text))
+        non_chinese_len = len(text) - chinese_count
+        return int(chinese_count / 1.5 + non_chinese_len / 4)
 
     def chunk_text(
         self,
@@ -187,8 +189,8 @@ class TextChunker:
                     current_chunk = []
                     current_tokens = 0
 
-                # 按句子切分长段落
-                sentences = re.split(r'(?<=[。！？.!?])\s*', para)
+                # 按句子切分长段落（支持中英文标点）
+                sentences = re.split(r'(?<=[。！？；.!?;])\s*', para)
                 for sent in sentences:
                     sent_tokens = self.count_tokens(sent)
                     if current_tokens + sent_tokens > max_tokens and current_chunk:

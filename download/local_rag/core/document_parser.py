@@ -74,13 +74,18 @@ class PDFParser(BaseParser):
         return "\n\n".join(pages_text)
 
     def _clean_text(self, text: str) -> str:
-        """清理 PDF 提取的文本"""
+        """清理 PDF 提取的文本（中文优化）"""
         # 移除多余的空白行
         text = re.sub(r'\n{3,}', '\n\n', text)
-        # 移除行内多余空格
+        # 移除行内多余空格（但保留中文之间的正常间隔）
         text = re.sub(r' +', ' ', text)
-        # 修复断行问题（中文不需要空格连接）
-        text = re.sub(r'(?<=[\u4e00-\u9fff])\n(?=[\u4e00-\u9fff])', '', text)
+        # 修复中文断行问题：相邻中文之间不需要空格或换行
+        text = re.sub(r'(?<=[\u4e00-\u9fff])\s*\n\s*(?=[\u4e00-\u9fff])', '', text)
+        # 修复中文与标点之间的异常空格
+        text = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[，。！？；：、）】」』])', '', text)
+        text = re.sub(r'(?<=[（【「『])\s+(?=[\u4e00-\u9fff])', '', text)
+        # 移除中文之间的异常空格
+        text = re.sub(r'(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])', '', text)
         return text.strip()
 
     def supported_extensions(self) -> List[str]:

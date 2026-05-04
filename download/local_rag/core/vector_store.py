@@ -242,16 +242,38 @@ class VectorStore:
     @staticmethod
     def _tokenize(text: str) -> List[str]:
         """
-        简单分词：中文按字符，英文按空格
-        生产环境建议使用 jieba 等专业分词器
+        中文优化的分词器
+
+        中文：尝试 jieba 分词（安装后自动启用），否则按 bigram 切分
+        英文：按空格分词
+        数字：保留完整数字串
         """
         tokens: List[str] = []
-        # 提取英文单词
+
+        # --- 中文分词 ---
+        # 提取中文片段
+        chinese_segments = re.findall(r'[\u4e00-\u9fff]+', text)
+        try:
+            import jieba
+            for seg in chinese_segments:
+                tokens.extend(jieba.lcut(seg))
+        except ImportError:
+            # jieba 未安装，使用 bigram（相邻两字组合）提升召回率
+            for seg in chinese_segments:
+                # 单字
+                tokens.extend(list(seg))
+                # bigram
+                for i in range(len(seg) - 1):
+                    tokens.append(seg[i:i+2])
+
+        # --- 英文分词 ---
         tokens.extend(re.findall(r'[a-zA-Z]+', text.lower()))
-        # 提取中文字符（每个字作为一个token）
-        tokens.extend(re.findall(r'[\u4e00-\u9fff]', text))
-        # 提取数字
+
+        # --- 数字 ---
         tokens.extend(re.findall(r'\d+', text))
+
+        # --- 中英混合术语（如 RAG系统 → rag, 系统）已被上面覆盖 ---
+
         return tokens
 
     async def save(self, directory: str):
