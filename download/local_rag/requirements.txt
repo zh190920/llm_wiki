@@ -1,39 +1,32 @@
-# Core Framework
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pydantic==2.9.0
-pydantic-settings==2.5.0
-
-# Async & Concurrency
-asyncio-throttle==1.0.2
-aiofiles==24.1.0
-httpx==0.27.2
+# Core
+openai>=1.30.0
+httpx>=0.27.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
 
 # Document Parsing
-pypdf==4.3.1
-python-docx==1.1.2
-python-pptx==1.0.2
-openpyxl==3.1.5
-beautifulsoup4==4.12.3
-markdown==3.7
+pymupdf>=1.24.0          # PDF parsing
+markdown>=3.6             # Markdown parsing
+beautifulsoup4>=4.12.0    # HTML cleaning
 
-# Embedding & Vector Store
-sentence-transformers==3.2.0
-faiss-cpu==1.9.0
-numpy==1.26.4
-
-# Keyword Search (BM25)
-jieba==0.42.1
-rank-bm25==0.2.2
+# Vector Store & Search
+faiss-cpu>=1.8.0          # Vector similarity search
+numpy>=1.26.0
+rank-bm25>=0.2.2          # BM25 keyword search
 
 # Knowledge Graph
-networkx==3.3
+networkx>=3.2.0           # Graph structure
 
-# LLM Client (OpenAI-compatible)
-openai==1.50.0
+# API Server
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+
+# Async & Concurrency
+asyncio
+aiofiles>=23.2.0
 
 # Utilities
-python-multipart==0.0.12
-PyYAML==6.0.2
-loguru==0.7.2
-tenacity==9.0.0
+tiktoken>=0.7.0           # Token counting
+tenacity>=8.3.0           # Retry logic
+python-multipart>=0.0.9   # File uploads
+pyyaml>=6.0               # Config files

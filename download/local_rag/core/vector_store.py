@@ -1,253 +1,319 @@
 """
-向量存储 — FAISS 本地向量数据库
-================================
-使用 FAISS 实现高性能本地向量存储和检索，
-支持 L2 距离和内积相似度搜索。
+向量存储模块 - 基于 FAISS 的高性能向量检索
+借鉴 WeKnora 的 retriever 设计，支持向量检索 + BM25 关键词检索的混合模式
 """
-
+import asyncio
 import json
+import logging
 import os
+import pickle
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import faiss
 import numpy as np
-from loguru import logger
+from rank_bm25 import BM25Okapi
 
-from config import settings
+from config.settings import RetrieverConfig
+from models.schemas import Chunk, MatchType, SearchResult
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStore:
-    """基于 FAISS 的本地向量存储"""
+    """
+    向量存储引擎
 
-    def __init__(self, dimension: int = None, store_dir: str = None):
-        self.dimension = dimension or settings.EMMBEDDING_DIMENSION if hasattr(settings, 'EMMBEDDING_DIMENSION') else settings.EMBEDDING_DIMENSION
-        self.store_dir = Path(store_dir) if store_dir else settings.VECTOR_DIR
-        self.store_dir.mkdir(parents=True, exist_ok=True)
+    特性：
+    - FAISS 向量索引（L2 + 内积支持）
+    - BM25 关键词检索
+    - 混合检索（向量 + 关键词加权融合）
+    - 持久化存储（索引 + 元数据）
+    - 异步并发安全
+    """
 
-        # FAISS 索引 (使用内积相似度，因为向量已归一化)
-        self._index: Optional[faiss.IndexFlatIP] = None
-        # ID 映射: faiss 内部 ID → chunk_id
-        self._id_map: dict[int, str] = {}
-        self._reverse_id_map: dict[str, int] = {}
-        # chunk 元数据
-        self._metadata: dict[str, dict] = {}
-        self._next_id = 0
+    def __init__(self, config: Optional[RetrieverConfig] = None, dim: int = 1536):
+        self.config = config or RetrieverConfig()
+        self.dim = dim
 
-    def _ensure_index(self):
-        """确保索引已初始化"""
-        if self._index is None:
-            self._index = faiss.IndexFlatIP(self.dimension)
-            logger.info(f"FAISS 索引已创建, 维度: {self.dimension}")
+        # FAISS 索引
+        self._index: Optional[faiss.IndexFlatIP] = None  # 内积索引（归一化后即余弦相似度）
+        self._chunks: List[Chunk] = []  # chunk_id -> Chunk 映射（有序）
+        self._id_map: Dict[str, int] = {}  # chunk_id -> FAISS 内部索引
 
-    async def add_vectors(
-        self,
-        chunk_ids: list[str],
-        vectors: np.ndarray,
-        metadata: Optional[list[dict]] = None,
-    ) -> int:
+        # BM25 索引
+        self._bm25: Optional[BM25Okapi] = None
+        self._bm25_corpus: List[List[str]] = []
+
+        # 锁（异步环境下的简单互斥）
+        self._lock = asyncio.Lock()
+
+        self._init_index()
+
+    def _init_index(self):
+        """初始化 FAISS 索引"""
+        self._index = faiss.IndexFlatIP(self.dim)  # 内积索引
+
+    async def add_chunks(self, chunks: List[Chunk], embeddings: List[List[float]]):
         """
-        添加向量到索引
+        添加文档块和对应的嵌入向量
 
         Args:
-            chunk_ids: chunk ID 列表
-            vectors: 向量矩阵 (N, dimension)
-            metadata: 元数据列表
-
-        Returns:
-            添加的向量数量
+            chunks: 文档块列表
+            embeddings: 对应的嵌入向量列表
         """
-        self._ensure_index()
+        if len(chunks) != len(embeddings):
+            raise ValueError(f"chunks 数量 ({len(chunks)}) 与 embeddings 数量 ({len(embeddings)}) 不匹配")
 
-        if len(chunk_ids) != vectors.shape[0]:
-            raise ValueError(f"chunk_ids 数量 ({len(chunk_ids)}) 与向量数量 ({vectors.shape[0]}) 不匹配")
+        async with self._lock:
+            vectors = np.array(embeddings, dtype=np.float32)
 
-        # 确保向量维度正确
-        if vectors.shape[1] != self.dimension:
-            raise ValueError(f"向量维度 ({vectors.shape[1]}) 与索引维度 ({self.dimension}) 不匹配")
+            # L2 归一化（使内积等于余弦相似度）
+            faiss.normalize_L2(vectors)
 
-        # 归一化向量
-        faiss.normalize_L2(vectors)
+            start_idx = self._index.ntotal
+            self._index.add(vectors)
 
-        # 添加到索引
-        start_id = self._next_id
-        self._index.add(vectors)
+            for i, chunk in enumerate(chunks):
+                faiss_idx = start_idx + i
+                self._chunks.append(chunk)
+                self._id_map[chunk.chunk_id] = faiss_idx
 
-        for i, chunk_id in enumerate(chunk_ids):
-            faiss_id = start_id + i
-            self._id_map[faiss_id] = chunk_id
-            self._reverse_id_map[chunk_id] = faiss_id
-            if metadata and i < len(metadata):
-                self._metadata[chunk_id] = metadata[i]
+            # 重建 BM25 索引
+            self._rebuild_bm25()
 
-        self._next_id += len(chunk_ids)
-        logger.info(f"已添加 {len(chunk_ids)} 个向量到索引, 总数: {self._index.ntotal}")
-        return len(chunk_ids)
+            logger.info(f"添加 {len(chunks)} 个块到向量存储，总计 {self._index.ntotal} 个块")
 
-    async def search(
+    async def search_vector(
         self,
-        query_vector: np.ndarray,
-        top_k: int = 5,
-        threshold: float = 0.0,
-        knowledge_base_ids: Optional[list[str]] = None,
-    ) -> list[dict]:
-        """
-        向量相似度搜索
-
-        Args:
-            query_vector: 查询向量 (dimension,)
-            top_k: 返回最相似的 K 个结果
-            threshold: 相似度阈值
-            knowledge_base_ids: 限定搜索的知识库 ID 列表
-
-        Returns:
-            [{"chunk_id": str, "score": float, "metadata": dict}, ...]
-        """
-        self._ensure_index()
-
+        query_embedding: List[float],
+        top_k: int = 10,
+        similarity_threshold: float = 0.0,
+    ) -> List[SearchResult]:
+        """向量检索"""
         if self._index.ntotal == 0:
             return []
 
-        # 归一化查询向量
-        query_vector = query_vector.reshape(1, -1).astype(np.float32)
-        faiss.normalize_L2(query_vector)
+        query_vec = np.array([query_embedding], dtype=np.float32)
+        faiss.normalize_L2(query_vec)
 
-        # 搜索
-        k = min(top_k * 3, self._index.ntotal)  # 过量搜索，后面再过滤
-        scores, indices = self._index.search(query_vector, k)
+        # 搜索 top_k * 2 个结果，然后按阈值过滤
+        search_k = min(top_k * 2, self._index.ntotal)
+        scores, indices = self._index.search(query_vec, search_k)
 
-        results = []
+        results: List[SearchResult] = []
         for score, idx in zip(scores[0], indices[0]):
             if idx < 0:
                 continue
-
-            chunk_id = self._id_map.get(int(idx))
-            if not chunk_id:
+            if score < similarity_threshold:
                 continue
+            if idx < len(self._chunks):
+                results.append(SearchResult(
+                    chunk=self._chunks[idx],
+                    score=float(score),
+                    match_type=MatchType.VECTOR,
+                ))
 
-            meta = self._metadata.get(chunk_id, {})
+        return results[:top_k]
 
-            # 按知识库 ID 过滤
-            if knowledge_base_ids:
-                kb_id = meta.get("knowledge_base_id", "")
-                if kb_id not in knowledge_base_ids:
-                    continue
+    async def search_keyword(
+        self,
+        query: str,
+        top_k: int = 10,
+    ) -> List[SearchResult]:
+        """BM25 关键词检索"""
+        if self._bm25 is None or not self._bm25_corpus:
+            return []
 
-            if score < threshold:
+        tokenized_query = self._tokenize(query)
+        scores = self._bm25.get_scores(tokenized_query)
+
+        # 获取 top_k 结果
+        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        results: List[SearchResult] = []
+        for idx in top_indices:
+            if scores[idx] <= 0:
                 continue
+            if idx < len(self._chunks):
+                # BM25 分数归一化到 [0, 1]
+                normalized_score = min(float(scores[idx]) / 30.0, 1.0)
+                results.append(SearchResult(
+                    chunk=self._chunks[idx],
+                    score=normalized_score,
+                    match_type=MatchType.KEYWORD,
+                ))
 
-            results.append({
-                "chunk_id": chunk_id,
-                "score": float(score),
-                "metadata": meta,
-            })
-
-        # 截断到 top_k
-        results = results[:top_k]
         return results
 
-    async def delete_by_knowledge_id(self, knowledge_id: str):
-        """删除指定文档的所有向量（重建索引）"""
-        to_remove = [
-            cid for cid, meta in self._metadata.items()
-            if meta.get("knowledge_id") == knowledge_id
-        ]
-        if not to_remove:
+    async def search_hybrid(
+        self,
+        query: str,
+        query_embedding: List[float],
+        top_k: int = 10,
+        alpha: float = 0.7,  # 向量检索权重
+    ) -> List[SearchResult]:
+        """
+        混合检索 - 融合向量检索和关键词检索结果
+
+        借鉴 WeKnora 的 composite retriever 设计：
+        - alpha 控制向量和关键词的权重
+        - 使用 Reciprocal Rank Fusion (RRF) 融合排序
+
+        Args:
+            query: 查询文本
+            query_embedding: 查询嵌入向量
+            top_k: 返回结果数
+            alpha: 向量检索权重 (0~1)
+        """
+        # 并发执行两种检索
+        vector_task = self.search_vector(
+            query_embedding, top_k=top_k * 2,
+            similarity_threshold=0.0,
+        )
+        keyword_task = self.search_keyword(query, top_k=top_k * 2)
+
+        vector_results, keyword_results = await asyncio.gather(
+            vector_task, keyword_task
+        )
+
+        # Reciprocal Rank Fusion (RRF) 融合
+        rrf_k = 60  # RRF 常数
+        score_map: Dict[str, float] = {}  # chunk_id -> rrf score
+        chunk_map: Dict[str, SearchResult] = {}  # chunk_id -> best result
+
+        for rank, result in enumerate(vector_results):
+            cid = result.chunk.chunk_id
+            rrf_score = alpha / (rrf_k + rank + 1)
+            score_map[cid] = score_map.get(cid, 0.0) + rrf_score
+            if cid not in chunk_map or result.score > chunk_map[cid].score:
+                chunk_map[cid] = result
+
+        for rank, result in enumerate(keyword_results):
+            cid = result.chunk.chunk_id
+            rrf_score = (1 - alpha) / (rrf_k + rank + 1)
+            score_map[cid] = score_map.get(cid, 0.0) + rrf_score
+            if cid not in chunk_map:
+                chunk_map[cid] = result
+
+        # 按 RRF 分数排序
+        sorted_ids = sorted(score_map.keys(), key=lambda x: score_map[x], reverse=True)
+
+        results: List[SearchResult] = []
+        for cid in sorted_ids[:top_k]:
+            result = chunk_map[cid]
+            # 更新分数为融合分数
+            results.append(SearchResult(
+                chunk=result.chunk,
+                score=score_map[cid],
+                match_type=result.match_type,
+            ))
+
+        return results
+
+    async def delete_by_doc_id(self, doc_id: str) -> int:
+        """删除指定文档的所有块（需要重建索引）"""
+        async with self._lock:
+            # 找到需要保留的块
+            kept_chunks = [c for c in self._chunks if c.doc_id != doc_id]
+            removed_count = len(self._chunks) - len(kept_chunks)
+
+            if removed_count > 0:
+                self._chunks = kept_chunks
+                # 需要重新添加（FAISS 不支持删除）
+                # 注意：调用方需要重新嵌入并添加
+                self._init_index()
+                self._id_map.clear()
+                self._rebuild_bm25()
+                logger.info(f"删除文档 {doc_id} 的 {removed_count} 个块，索引已清空，需重新添加")
+
+            return removed_count
+
+    def _rebuild_bm25(self):
+        """重建 BM25 索引"""
+        if not self._chunks:
+            self._bm25 = None
+            self._bm25_corpus = []
             return
 
-        # FAISS 不支持直接删除，需要重建索引
-        await self._rebuild_without(to_remove)
+        self._bm25_corpus = [self._tokenize(chunk.content) for chunk in self._chunks]
+        self._bm25 = BM25Okapi(self._bm25_corpus)
 
-    async def delete_by_knowledge_base_id(self, knowledge_base_id: str):
-        """删除指定知识库的所有向量"""
-        to_remove = [
-            cid for cid, meta in self._metadata.items()
-            if meta.get("knowledge_base_id") == knowledge_base_id
-        ]
-        if not to_remove:
-            return
-        await self._rebuild_without(to_remove)
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """
+        简单分词：中文按字符，英文按空格
+        生产环境建议使用 jieba 等专业分词器
+        """
+        tokens: List[str] = []
+        # 提取英文单词
+        tokens.extend(re.findall(r'[a-zA-Z]+', text.lower()))
+        # 提取中文字符（每个字作为一个token）
+        tokens.extend(re.findall(r'[\u4e00-\u9fff]', text))
+        # 提取数字
+        tokens.extend(re.findall(r'\d+', text))
+        return tokens
 
-    async def _rebuild_without(self, chunk_ids_to_remove: set[str]):
-        """重建索引，排除指定的 chunk"""
-        self._ensure_index()
+    async def save(self, directory: str):
+        """持久化存储向量索引和元数据"""
+        dir_path = Path(directory)
+        dir_path.mkdir(parents=True, exist_ok=True)
 
-        # 收集需要保留的向量
-        remaining_vectors = []
-        remaining_ids = []
-        remaining_metadata = {}
+        async with self._lock:
+            # 保存 FAISS 索引
+            faiss.write_index(self._index, str(dir_path / "faiss.index"))
 
-        for faiss_id, chunk_id in self._id_map.items():
-            if chunk_id in chunk_ids_to_remove:
-                continue
-            vector = self._index.reconstruct(int(faiss_id))
-            remaining_vectors.append(vector)
-            remaining_ids.append(chunk_id)
-            if chunk_id in self._metadata:
-                remaining_metadata[chunk_id] = self._metadata[chunk_id]
+            # 保存元数据
+            metadata = {
+                "chunks": [c.model_dump() for c in self._chunks],
+                "id_map": self._id_map,
+                "dim": self.dim,
+            }
+            with open(dir_path / "metadata.pkl", "wb") as f:
+                pickle.dump(metadata, f)
 
-        # 重建索引
-        self._index = faiss.IndexFlatIP(self.dimension)
-        self._id_map = {}
-        self._reverse_id_map = {}
-        self._metadata = remaining_metadata
-        self._next_id = 0
+            logger.info(f"向量存储已保存到 {directory}，共 {self._index.ntotal} 个块")
 
-        if remaining_vectors:
-            vectors = np.stack(remaining_vectors)
-            self._index.add(vectors)
-            for i, chunk_id in enumerate(remaining_ids):
-                self._id_map[i] = chunk_id
-                self._reverse_id_map[chunk_id] = i
-            self._next_id = len(remaining_ids)
+    async def load(self, directory: str):
+        """从磁盘加载向量索引和元数据"""
+        dir_path = Path(directory)
 
-        logger.info(f"索引重建完成, 剩余向量: {self._index.ntotal}")
-
-    async def save(self, knowledge_base_id: str):
-        """持久化索引到磁盘"""
-        if self._index is None or self._index.ntotal == 0:
+        if not (dir_path / "faiss.index").exists():
+            logger.warning(f"向量存储目录不存在: {directory}")
             return
 
-        kb_dir = self.store_dir / knowledge_base_id
-        kb_dir.mkdir(parents=True, exist_ok=True)
+        async with self._lock:
+            # 加载 FAISS 索引
+            self._index = faiss.read_index(str(dir_path / "faiss.index"))
 
-        # 保存 FAISS 索引
-        faiss.write_index(self._index, str(kb_dir / "index.faiss"))
+            # 加载元数据
+            with open(dir_path / "metadata.pkl", "rb") as f:
+                metadata = pickle.load(f)
 
-        # 保存元数据
-        meta = {
-            "id_map": {str(k): v for k, v in self._id_map.items()},
-            "metadata": self._metadata,
-            "next_id": self._next_id,
-            "dimension": self.dimension,
-        }
-        with open(kb_dir / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+            self._chunks = [Chunk(**c) for c in metadata["chunks"]]
+            self._id_map = metadata["id_map"]
+            self.dim = metadata.get("dim", self.dim)
 
-        logger.info(f"向量索引已保存: {kb_dir}")
+            # 重建 BM25 索引
+            self._rebuild_bm25()
 
-    async def load(self, knowledge_base_id: str) -> bool:
-        """从磁盘加载索引"""
-        kb_dir = self.store_dir / knowledge_base_id
-        index_path = kb_dir / "index.faiss"
-        meta_path = kb_dir / "metadata.json"
-
-        if not index_path.exists() or not meta_path.exists():
-            return False
-
-        self._index = faiss.read_index(str(index_path))
-
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-
-        self._id_map = {int(k): v for k, v in meta["id_map"].items()}
-        self._metadata = meta["metadata"]
-        self._next_id = meta["next_id"]
-        self._reverse_id_map = {v: k for k, v in self._id_map.items()}
-
-        logger.info(f"向量索引已加载: {kb_dir}, 向量数: {self._index.ntotal}")
-        return True
+            logger.info(f"向量存储已加载: {directory}，共 {self._index.ntotal} 个块")
 
     @property
-    def total_vectors(self) -> int:
-        return self._index.ntotal if self._index else 0
+    def total_chunks(self) -> int:
+        return len(self._chunks)
+
+    def get_chunks_by_doc_id(self, doc_id: str) -> List[Chunk]:
+        """获取指定文档的所有块"""
+        return [c for c in self._chunks if c.doc_id == doc_id]
+
+    def get_chunk_by_id(self, chunk_id: str) -> Optional[Chunk]:
+        """根据 chunk_id 获取块"""
+        for c in self._chunks:
+            if c.chunk_id == chunk_id:
+                return c
+        return None
+
+
+# 需要 import re
+import re

@@ -1,593 +1,526 @@
 """
-Wiki Ingest Pipeline — 文档自动生成 Wiki 知识库
-================================
-借鉴 WeKnora 的 wikiIngestService 设计，
-实现 Map-Reduce 流水线:
-  Map:   从文档中提取实体/概念/摘要
-  Reduce: 合并/去重/更新 Wiki 页面
+Wiki Ingest 管道 - 从原始文档生成 Wiki 知识库
+借鉴 WeKnora 的 Map-Reduce Wiki Ingest 设计
 
-核心特点:
-1. LLM 驱动的实体和概念提取
-2. 基于分块引用的两阶段提取（候选提取 + 分块引用）
-3. 实体去重和合并
-4. Wiki 页面的增量更新
-5. 交叉链接自动注入
+流程：
+MAP 阶段（每个文档）:
+  1. 生成文档摘要页
+  2. 提取实体和概念（候选slug）
+  3. 对已有页面去重
+
+REDUCE 阶段（每个实体/概念）:
+  4. 收集相关文档块
+  5. 创建/更新 Wiki 页面
+
+POST 阶段:
+  6. 发布所有草稿页面
+  7. 重建索引页
+  8. 注入跨页面链接
+  9. 清理死链接
 """
-
 import asyncio
 import json
+import logging
 import re
-from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional, Set
 
-from loguru import logger
+from openai import AsyncOpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-from core.llm_client import LLMClient, parse_llm_json, repair_json
-from wiki.page_manager import WikiPage, WikiPageManager
-from config import settings
+from agent.prompts import (
+    WIKI_DEDUPLICATION_PROMPT,
+    WIKI_ENTITY_EXTRACTION_PROMPT,
+    WIKI_INDEX_PROMPT,
+    WIKI_PAGE_MODIFY_PROMPT,
+    WIKI_SUMMARY_PROMPT,
+)
+from config.settings import AppConfig
+from core.vector_store import VectorStore
+from models.schemas import Chunk, WikiPage, WikiPageType
+from wiki.page_manager import WikiPageManager
 
-
-# ── Prompt 模板 (借鉴 WeKnora 的 prompts_wiki.go) ──
-
-WIKI_SUMMARY_PROMPT = """你是一个 Wiki 编辑。根据以下文档内容，创建一个结构化的 Wiki 摘要页面。
-
-<document>
-<title>{title}</title>
-<file_name>{file_name}</file_name>
-<content>
-{content}
-</content>
-</document>
-
-<available_wiki_pages>
-{available_slugs}
-</available_wiki_pages>
-
-<instructions>
-1. 输出的第一行必须是: SUMMARY: {一句话描述文档内容，15-40字}
-2. 在 SUMMARY 行之后，用 Markdown 格式撰写文档的综合摘要
-3. 包含关键事实、论点和结论
-4. 使用正确的标题层级 (## 用于章节，### 用于子节)
-5. **Wiki 链接规则**: 当你提到 available_wiki_pages 列表中的名称时，必须写成 [[slug|显示名称]] 的格式
-6. 最后包含一个 "## 要点总结" 章节
-7. 用{language}撰写
-8. 保持摘要简洁但全面（500-1500字）
-</instructions>
-
-先输出 SUMMARY 行，然后是 Markdown 内容。"""
-
-WIKI_KNOWLEDGE_EXTRACT_PROMPT = """你是一个知识提取系统。分析以下文档并提取所有重要实体和关键概念。
-
-<document>
-<title>{title}</title>
-<content>
-{content}
-</content>
-</document>
-
-<previous_slugs>
-{previous_slugs}
-</previous_slugs>
-
-<instructions>
-返回一个 JSON 对象，包含两个数组："entities" 和 "concepts"。
-**重要：所有名称、描述和详情用{language}撰写。**
-
-### 实体 (人物、组织、产品、地点、技术、事件等)
-每个实体应包含:
-- "name": 实体名称
-- "slug": URL 友好的标识符，格式 "entity/<小写连字符名>"
-- "aliases": 别名数组（同义名称）
-- "description": 一句话索引描述（15-40字）
-- "details": 2-5句关键事实摘要
-
-### 概念 (主题、方法论、理论等)
-每个概念应包含:
-- "name": 概念名称
-- "slug": URL 友好的标识符，格式 "concept/<小写连字符名>"
-- "aliases": 别名数组
-- "description": 一句话定义（15-40字）
-- "details": 2-5句解释
-
-### 去重规则
-- 具体命名事物放入 "entities"
-- 抽象想法/方法论放入 "concepts"
-- 两个数组之间不重复
-
-只输出有效的 JSON。"""
-
-WIKI_PAGE_MODIFY_PROMPT = """你是一个 Wiki 编辑，负责更新现有 Wiki 页面。
-
-<page_metadata>
-  <slug>{page_slug}</slug>
-  <title>{page_title}</title>
-  <type>{page_type}</type>
-</page_metadata>
-
-此 Wiki 页面专门关于 **{page_title}**。
-
-<existing_page_content>
-{existing_content}
-</existing_page_content>
-
-<new_information>
-{new_content}
-</new_information>
-
-<valid_wiki_links>
-{available_slugs}
-</valid_wiki_links>
-
-<instructions>
-1. 输出的第一行必须是: SUMMARY: {一句话描述此页面更新后的内容，15-40字}
-2. 将新信息合并到页面中。贴近原文措辞，不要过度改写。
-3. 如果新信息与旧内容矛盾，优先采用新信息。
-4. 保留仍有效的现有信息。
-5. 只保留 <valid_wiki_links> 中存在的 [[slug|name]] 链接。
-6. 用{language}撰写
-</instructions>
-
-先输出 SUMMARY 行，然后是更新后的 Markdown 内容。"""
-
-WIKI_DEDUPLICATION_PROMPT = """你是一个严格去重系统。给定一组新提取的项目和现有 Wiki 页面列表，判断哪些新项目与现有页面指的是同一个事物。
-
-<new_items>
-{new_items}
-</new_items>
-
-<existing_pages>
-{existing_pages}
-</existing_pages>
-
-<instructions>
-### 合并标准 — 必须全部满足:
-1. 新项目和现有页面指的是**同一个真实事物**
-2. 匹配是名称变体：缩写 ↔ 全称、翻译、或轻微拼写差异
-3. 类型兼容：实体与实体合并，概念与概念合并
-
-### 关键原则: **相关 ≠ 相同**。有疑问时不要合并。
-
-返回 JSON 对象，键是新项目的 slug，值是应合并到的现有页面 slug。
-如果没有匹配，返回: {{"merges": {{}}}}
-
-只输出有效的 JSON。"""
+logger = logging.getLogger(__name__)
 
 
-class WikiIngestPipeline:
-    """Wiki 知识库自动生成流水线"""
+class WikiIngest:
+    """
+    Wiki 生成管道
 
-    def __init__(
+    借鉴 WeKnora 的 Map-Reduce 架构：
+    - MAP 阶段：每个文档独立提取实体和概念
+    - REDUCE 阶段：每个实体/概念创建或更新页面
+    - POST 阶段：链接注入和索引构建
+
+    粒度控制（granularity）：
+    - focused: 少量核心实体/概念
+    - standard: 适度提取
+    - exhaustive: 尽可能提取所有实体/概念
+    """
+
+    def __init__(self, config: AppConfig, wiki_manager: WikiPageManager):
+        self.config = config
+        self.wiki_manager = wiki_manager
+        self._client = AsyncOpenAI(
+            api_key=config.llm.api_key,
+            base_url=config.llm.base_url,
+            timeout=config.llm.timeout,
+        )
+
+        # 粒度映射到提取指令
+        self._granularity_instructions = {
+            "focused": "只提取最核心的、最重要的实体和概念（5-10个）。",
+            "standard": "提取所有重要的实体和概念（10-30个）。",
+            "exhaustive": "尽可能提取所有提到的实体和概念，包括次要的（不限制数量）。",
+        }
+
+    async def ingest_documents(
         self,
-        llm_client: LLMClient,
-        page_manager: WikiPageManager,
-    ):
-        self.llm_client = llm_client
-        self.page_manager = page_manager
-
-    async def ingest_document(
-        self,
-        kb_id: str,
-        knowledge_id: str,
-        title: str,
-        file_name: str,
-        content: str,
-        language: str = None,
-    ) -> list[str]:
+        doc_ids: List[str],
+        vector_store: VectorStore,
+        granularity: str = "standard",
+    ) -> Dict[str, int]:
         """
-        入库单个文档，生成 Wiki 页面
-
-        流程 (借鉴 WeKnora 的 Map-Reduce Pipeline):
-        1. Map: 生成文档摘要页 + 提取实体/概念
-        2. Dedup: 与已有页面去重
-        3. Reduce: 创建/更新 Wiki 页面
-        4. Link: 注入交叉链接
+        对指定文档执行 Wiki 生成管道
 
         Args:
-            kb_id: 知识库 ID
-            knowledge_id: 文档 ID
-            title: 文档标题
-            file_name: 文件名
-            content: 文档内容
-            language: 语言
+            doc_ids: 文档 ID 列表
+            vector_store: 向量存储（用于获取文档块）
+            granularity: 提取粒度
 
         Returns:
-            受影响的页面 slug 列表
+            统计信息 {"pages_created": int, "pages_updated": int, "links_injected": int}
         """
-        language = language or settings.WIKI_LANGUAGE
-        content = content[:settings.WIKI_MAX_CONTENT]
+        stats = {"pages_created": 0, "pages_updated": 0, "links_injected": 0}
 
-        logger.info(f"[Wiki] 开始入库: {title} (KB: {kb_id})")
+        # 收集所有相关文档块，按文档分组
+        doc_chunks: Dict[str, List[Chunk]] = {}
+        for doc_id in doc_ids:
+            chunks = vector_store.get_chunks_by_doc_id(doc_id)
+            if chunks:
+                doc_chunks[doc_id] = chunks
 
-        affected_slugs = []
+        if not doc_chunks:
+            logger.warning("没有找到指定文档的内容")
+            return stats
 
-        # ── Phase 1: 生成摘要页 ──
-        summary_slug = f"summary/{self._slugify(title)}"
-        available_slugs = self._get_available_slugs(kb_id)
+        # ========== MAP 阶段 ==========
 
-        summary_content = await self._generate_summary(
-            title=title,
-            file_name=file_name,
-            content=content,
-            available_slugs=available_slugs,
-            language=language,
-        )
+        # 1. 为每个文档生成摘要页
+        summary_tasks = []
+        for doc_id, chunks in doc_chunks.items():
+            summary_tasks.append(self._generate_summary_page(doc_id, chunks, granularity))
 
-        summary, summary_body = self._split_summary_line(summary_content)
+        summary_pages = await asyncio.gather(*summary_tasks, return_exceptions=True)
 
-        summary_page = WikiPage(
-            knowledge_base_id=kb_id,
-            slug=summary_slug,
-            title=f"摘要: {title}",
-            page_type="summary",
-            content=summary_body,
-            summary=summary or title,
-            source_refs=[knowledge_id],
-        )
-        self.page_manager.create_page(summary_page)
-        affected_slugs.append(summary_slug)
+        for result in summary_pages:
+            if isinstance(result, Exception):
+                logger.error(f"生成摘要页失败: {result}")
+                continue
+            if result:
+                await self.wiki_manager.save_page(result)
+                stats["pages_created"] += 1
 
-        # ── Phase 2: 提取实体和概念 ──
-        extraction = await self._extract_knowledge(
-            title=title,
-            content=content,
-            previous_slugs=available_slugs,
-            language=language,
-        )
+        # 2. 从每个文档提取实体和概念（2-pass）
+        extraction_tasks = []
+        for doc_id, chunks in doc_chunks.items():
+            extraction_tasks.append(self._extract_entities(doc_id, chunks, granularity))
 
-        entities = extraction.get("entities", [])
-        concepts = extraction.get("concepts", [])
+        extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
 
-        logger.info(f"[Wiki] 提取结果: {len(entities)} 实体, {len(concepts)} 概念")
+        # 收集所有候选实体
+        all_candidates: List[dict] = []
+        for result in extraction_results:
+            if isinstance(result, Exception):
+                logger.error(f"提取实体失败: {result}")
+                continue
+            all_candidates.extend(result)
 
-        # ── Phase 3: 去重 ──
-        entities, concepts = await self._deduplicate(
-            kb_id=kb_id,
-            entities=entities,
-            concepts=concepts,
-        )
+        # 3. 去重
+        existing_pages = await self.wiki_manager.list_pages()
+        deduplicated = await self._deduplicate_candidates(all_candidates, existing_pages)
+        logger.info(f"实体去重: {len(all_candidates)} → {len(deduplicated)} 个候选")
 
-        # ── Phase 4: 创建/更新页面 ──
-        for item in entities + concepts:
-            item_type = "entity" if item in entities else "concept"
-            slug = item.get("slug", f"{item_type}/{self._slugify(item.get('name', ''))}")
+        # ========== REDUCE 阶段 ==========
 
-            existing = self.page_manager.get_page(kb_id, slug)
-
-            if existing:
-                # 更新已有页面
-                updated_content = await self._modify_page(
-                    kb_id=kb_id,
-                    page_slug=slug,
-                    page_title=existing.title,
-                    page_type=existing.page_type,
-                    existing_content=existing.content,
-                    new_content=item.get("details", ""),
-                    available_slugs=self._get_available_slugs(kb_id),
-                    language=language,
+        # 4. 为每个实体/概念创建 Wiki 页面
+        page_tasks = []
+        for candidate in deduplicated:
+            # 收集与此实体相关的文档块
+            related_chunks = self._find_related_chunks(
+                candidate, doc_chunks
+            )
+            if related_chunks:
+                page_tasks.append(
+                    self._create_entity_page(candidate, related_chunks)
                 )
-                _, body = self._split_summary_line(updated_content)
-                existing.content = body
-                existing.source_refs = list(set(existing.source_refs + [knowledge_id]))
-                self.page_manager.update_page(existing)
-            else:
-                # 创建新页面
-                new_summary, new_body = self._split_summary_line(item.get("details", ""))
-                page = WikiPage(
-                    knowledge_base_id=kb_id,
-                    slug=slug,
-                    title=item.get("name", ""),
-                    page_type=item_type,
-                    content=f"# {item.get('name', '')}\n\n{new_body}",
-                    summary=item.get("description", new_summary or ""),
-                    aliases=item.get("aliases", []),
-                    source_refs=[knowledge_id],
+
+        # 限制并发数
+        semaphore = asyncio.Semaphore(self.config.wiki.max_concurrent_extractions)
+
+        async def _limited_create(task):
+            async with semaphore:
+                return await task
+
+        page_results = await asyncio.gather(
+            *[_limited_create(t) for t in page_tasks],
+            return_exceptions=True,
+        )
+
+        for result in page_results:
+            if isinstance(result, Exception):
+                logger.error(f"创建页面失败: {result}")
+                continue
+            if result:
+                existing = await self.wiki_manager.get_page(result.slug)
+                if existing:
+                    await self.wiki_manager.save_page(result)
+                    stats["pages_updated"] += 1
+                else:
+                    await self.wiki_manager.save_page(result)
+                    stats["pages_created"] += 1
+
+        # ========== POST 阶段 ==========
+
+        # 6. 发布草稿页面
+        for page in await self.wiki_manager.list_pages():
+            if page.status == "draft":
+                page.status = "published"
+                await self.wiki_manager.save_page(page)
+
+        # 7. 重建索引页
+        index_page = await self._rebuild_index()
+        if index_page:
+            await self.wiki_manager.save_page(index_page)
+
+        # 8. 注入跨页面链接
+        await self.wiki_manager.inject_cross_links()
+        stats["links_injected"] = self.wiki_manager.total_pages
+
+        logger.info(f"Wiki 生成完成: {stats}")
+        return stats
+
+    async def _generate_summary_page(
+        self, doc_id: str, chunks: List[Chunk], granularity: str
+    ) -> Optional[WikiPage]:
+        """MAP: 为文档生成摘要页"""
+        # 合并文档内容
+        content = "\n\n".join([c.content for c in chunks[:10]])  # 限制长度
+        if len(content) > 4000:
+            content = content[:4000]
+
+        prompt = WIKI_SUMMARY_PROMPT.format(content=content, title=doc_id)
+
+        try:
+            response = await self._client.chat.completions.create(
+                model=self.config.llm.chat_model,
+                messages=[
+                    {"role": "system", "content": "你是一个专业的知识整理专家。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=2000,
+            )
+
+            page_content = response.choices[0].message.content.strip()
+
+            slug = self._title_to_slug(f"summary-{doc_id}")
+            return WikiPage(
+                slug=slug,
+                title=f"文档摘要: {doc_id}",
+                page_type=WikiPageType.SUMMARY,
+                content=page_content,
+                source_doc_ids=[doc_id],
+                source_chunk_ids=[c.chunk_id for c in chunks[:10]],
+                status="draft",
+            )
+
+        except Exception as e:
+            logger.error(f"生成摘要页失败 (doc={doc_id}): {e}")
+            return None
+
+    async def _extract_entities(
+        self, doc_id: str, chunks: List[Chunk], granularity: str
+    ) -> List[dict]:
+        """
+        MAP: 从文档中提取实体和概念
+
+        借鉴 WeKnora 的 2-pass 提取设计：
+        - Pass 0: 提取候选实体（轻量级）
+        - Pass 1-N: 为每批块分配引用（哪些块提到哪些实体）
+        """
+        granularity_instruction = self._granularity_instructions.get(
+            granularity, self._granularity_instructions["standard"]
+        )
+
+        # 分批处理（避免上下文过长）
+        batch_size = self.config.wiki.chunk_batch_size
+        all_entities: List[dict] = []
+        seen_titles: Set[str] = set()
+
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]
+            batch_content = "\n\n---\n\n".join([c.content for c in batch])
+
+            prompt = (
+                f"{WIKI_ENTITY_EXTRACTION_PROMPT.format(content=batch_content)}\n\n"
+                f"提取要求：{granularity_instruction}"
+            )
+
+            try:
+                response = await self._client.chat.completions.create(
+                    model=self.config.llm.chat_model,
+                    messages=[
+                        {"role": "system", "content": "你是一个专业的实体和概念提取专家。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=2000,
                 )
-                self.page_manager.create_page(page)
 
-            affected_slugs.append(slug)
+                result_text = response.choices[0].message.content.strip()
+                entities = self._parse_json_list(result_text)
 
-        # ── Phase 5: 更新索引页 ──
-        await self._rebuild_index(kb_id, language)
+                for entity in entities:
+                    title = entity.get("title", "").strip()
+                    if title and title not in seen_titles:
+                        seen_titles.add(title)
+                        entity["source_doc_id"] = doc_id
+                        entity["source_chunk_ids"] = [c.chunk_id for c in batch]
+                        all_entities.append(entity)
 
-        # ── Phase 6: 注入交叉链接 ──
-        self._inject_cross_links(kb_id, affected_slugs)
+            except Exception as e:
+                logger.error(f"实体提取失败 (doc={doc_id}, batch={i}): {e}")
+                continue
 
-        # 持久化
-        self.page_manager.save_to_disk(kb_id)
+        return all_entities
 
-        logger.info(f"[Wiki] 入库完成: {title}, 影响 {len(affected_slugs)} 个页面")
-        return affected_slugs
-
-    async def _generate_summary(
+    async def _deduplicate_candidates(
         self,
-        title: str,
-        file_name: str,
-        content: str,
-        available_slugs: str,
-        language: str,
-    ) -> str:
-        """生成文档摘要页"""
-        prompt = WIKI_SUMMARY_PROMPT.format(
-            title=title,
-            file_name=file_name,
-            content=content,
-            available_slugs=available_slugs,
-            language=language,
-        )
-        return await self.llm_client.generate_with_template(
-            system_prompt="你是专业的 Wiki 编辑。",
-            user_content=prompt,
-            temperature=0.1,
-        )
+        candidates: List[dict],
+        existing_pages: List[WikiPage],
+    ) -> List[dict]:
+        """对候选实体与已有页面进行去重"""
+        if not existing_pages or not candidates:
+            return candidates
 
-    async def _extract_knowledge(
-        self,
-        title: str,
-        content: str,
-        previous_slugs: str,
-        language: str,
-    ) -> dict:
-        """提取实体和概念"""
-        prompt = WIKI_KNOWLEDGE_EXTRACT_PROMPT.format(
-            title=title,
-            content=content,
-            previous_slugs=previous_slugs,
-            language=language,
-        )
-        response = await self.llm_client.generate_with_template(
-            system_prompt="你是知识提取专家。",
-            user_content=prompt,
-            temperature=0.1,
-        )
-        return parse_llm_json(response)
+        # 简单去重：标题完全匹配
+        existing_titles = {p.title.lower() for p in existing_pages}
+        existing_slugs = {p.slug for p in existing_pages}
 
-    async def _deduplicate(
-        self,
-        kb_id: str,
-        entities: list[dict],
-        concepts: list[dict],
-    ) -> tuple[list[dict], list[dict]]:
-        """实体/概念去重"""
-        existing_pages = self.page_manager.list_pages(kb_id)
-        entity_concept_pages = [
-            p for p in existing_pages if p.page_type in ("entity", "concept")
-        ]
+        unique_candidates = []
+        for candidate in candidates:
+            title = candidate.get("title", "")
+            slug = candidate.get("slug", self._title_to_slug(title))
 
-        if not entity_concept_pages or (not entities and not concepts):
-            return entities, concepts
+            if title.lower() not in existing_titles and slug not in existing_slugs:
+                unique_candidates.append(candidate)
 
-        # 构建去重 Prompt 输入
-        new_items_str = self._format_items_for_dedup(entities, concepts)
-        existing_pages_str = self._format_existing_pages_for_dedup(entity_concept_pages)
+        # 如果候选数较多，使用 LLM 进行语义去重
+        if len(unique_candidates) > 5 and existing_pages:
+            try:
+                new_entities_text = json.dumps(
+                    [{"title": e.get("title"), "slug": e.get("slug")}
+                     for e in unique_candidates],
+                    ensure_ascii=False,
+                )
+                existing_text = "\n".join(
+                    [f"- {p.title} (slug: {p.slug})" for p in existing_pages[:20]]
+                )
 
-        prompt = WIKI_DEDUPLICATION_PROMPT.format(
-            new_items=new_items_str,
-            existing_pages=existing_pages_str,
+                prompt = WIKI_DEDUPLICATION_PROMPT.format(
+                    new_entities=new_entities_text,
+                    existing_pages=existing_text,
+                )
+
+                response = await self._client.chat.completions.create(
+                    model=self.config.llm.chat_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=1000,
+                )
+
+                dedup_result = self._parse_json_list(response.choices[0].message.content)
+
+                # 根据去重结果过滤
+                merge_slugs = set()
+                for item in dedup_result:
+                    if item.get("action") == "merge":
+                        merge_slug = item.get("merge_to", "")
+                        if merge_slug:
+                            merge_slugs.add(merge_slug)
+
+                # 保留 action=create 的候选
+                filtered = []
+                for candidate, dedup_item in zip(unique_candidates, dedup_result):
+                    if dedup_item.get("action") != "merge":
+                        filtered.append(candidate)
+
+                return filtered if filtered else unique_candidates
+
+            except Exception as e:
+                logger.warning(f"LLM 去重失败，使用简单去重: {e}")
+
+        return unique_candidates
+
+    def _find_related_chunks(
+        self, entity: dict, doc_chunks: Dict[str, List[Chunk]]
+    ) -> List[Chunk]:
+        """查找与实体相关的文档块"""
+        title = entity.get("title", "")
+        description = entity.get("description", "")
+        source_chunk_ids = entity.get("source_chunk_ids", [])
+
+        related = []
+        seen_ids = set()
+
+        # 优先使用源文档块
+        for doc_chunks_list in doc_chunks.values():
+            for chunk in doc_chunks_list:
+                if chunk.chunk_id in source_chunk_ids and chunk.chunk_id not in seen_ids:
+                    related.append(chunk)
+                    seen_ids.add(chunk.chunk_id)
+
+        # 补充：标题出现在内容中的块
+        if title:
+            for doc_chunks_list in doc_chunks.values():
+                for chunk in doc_chunks_list:
+                    if chunk.chunk_id not in seen_ids and title.lower() in chunk.content.lower():
+                        related.append(chunk)
+                        seen_ids.add(chunk.chunk_id)
+                        if len(related) >= 10:
+                            break
+
+        return related[:10]  # 限制每个实体最多10个块
+
+    async def _create_entity_page(
+        self, entity: dict, chunks: List[Chunk]
+    ) -> Optional[WikiPage]:
+        """REDUCE: 为实体创建 Wiki 页面"""
+        title = entity.get("title", "")
+        slug = entity.get("slug", self._title_to_slug(title))
+        description = entity.get("description", "")
+        entity_type = entity.get("type", "concept")
+
+        chunks_text = "\n\n---\n\n".join([f"[chunk: {c.chunk_id}]\n{c.content[:500]}" for c in chunks])
+
+        prompt = WIKI_PAGE_MODIFY_PROMPT.format(
+            entity_title=title,
+            entity_description=description,
+            entity_type=entity_type,
+            chunks=chunks_text,
         )
 
         try:
-            response = await self.llm_client.generate_with_template(
-                system_prompt="你是去重专家。",
-                user_content=prompt,
-                temperature=0.0,
+            response = await self._client.chat.completions.create(
+                model=self.config.llm.chat_model,
+                messages=[
+                    {"role": "system", "content": "你是一个专业的知识库编辑。请根据提供的文档内容创建准确、详细的 Wiki 页面。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=3000,
             )
-            result = parse_llm_json(response)
-            merges = result.get("merges", {})
 
-            if merges:
-                # 处理合并
-                for new_slug, existing_slug in merges.items():
-                    # 从新提取中移除被合并的项
-                    entities = [e for e in entities if e.get("slug") != new_slug]
-                    concepts = [c for c in concepts if c.get("slug") != new_slug]
+            page_content = response.choices[0].message.content.strip()
 
-                logger.info(f"[Wiki] 去重合并: {len(merges)} 项")
+            # 提取出链
+            out_links = re.findall(r'\[\[([^\]|]+)', page_content)
+
+            page_type = WikiPageType.ENTITY if entity_type == "entity" else WikiPageType.CONCEPT
+
+            return WikiPage(
+                slug=slug,
+                title=title,
+                page_type=page_type,
+                content=page_content,
+                source_doc_ids=list(set(entity.get("source_doc_id", "") for e in [entity] if entity.get("source_doc_id"))),
+                source_chunk_ids=[c.chunk_id for c in chunks],
+                out_links=out_links,
+                status="draft",
+            )
 
         except Exception as e:
-            logger.warning(f"[Wiki] 去重失败: {e}")
+            logger.error(f"创建实体页面失败 (entity={title}): {e}")
+            return None
 
-        return entities, concepts
-
-    async def _modify_page(
-        self,
-        kb_id: str,
-        page_slug: str,
-        page_title: str,
-        page_type: str,
-        existing_content: str,
-        new_content: str,
-        available_slugs: str,
-        language: str,
-    ) -> str:
-        """更新已有 Wiki 页面"""
-        prompt = WIKI_PAGE_MODIFY_PROMPT.format(
-            page_slug=page_slug,
-            page_title=page_title,
-            page_type=page_type,
-            existing_content=existing_content[:4000],
-            new_content=new_content[:2000],
-            available_slugs=available_slugs,
-            language=language,
-        )
-        return await self.llm_client.generate_with_template(
-            system_prompt="你是专业的 Wiki 编辑。",
-            user_content=prompt,
-            temperature=0.1,
-        )
-
-    async def _rebuild_index(self, kb_id: str, language: str):
-        """重建索引页"""
-        all_pages = self.page_manager.list_pages(kb_id)
-        non_system = [p for p in all_pages if p.page_type not in ("index", "log")]
+    async def _rebuild_index(self) -> Optional[WikiPage]:
+        """重建 Wiki 索引页"""
+        pages = await self.wiki_manager.list_pages()
 
         # 按类型分组
-        grouped = {}
-        for p in non_system:
-            grouped.setdefault(p.page_type, []).append(p)
+        pages_text = ""
+        for page_type in WikiPageType:
+            type_pages = [p for p in pages if p.page_type == page_type]
+            if type_pages:
+                pages_text += f"\n### {page_type.value.upper()}\n"
+                for p in type_pages:
+                    pages_text += f"- [[{p.slug}|{p.title}]]\n"
 
-        type_labels = {
-            "summary": "文档摘要",
-            "entity": "实体",
-            "concept": "概念",
-            "synthesis": "综合",
-        }
+        prompt = WIKI_INDEX_PROMPT.format(pages=pages_text)
 
-        # 构建目录
-        dir_lines = []
-        for ptype, labels in type_labels.items():
-            pages = grouped.get(ptype, [])
-            if not pages:
-                continue
-            dir_lines.append(f"\n## {labels} ({len(pages)})\n")
-            for p in pages:
-                dir_lines.append(f"[[{p.slug}]] — {p.summary}")
+        try:
+            response = await self._client.chat.completions.create(
+                model=self.config.llm.chat_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=2000,
+            )
 
-        intro = "# Wiki 索引\n\n本 Wiki 包含从上传文档中自动提取的知识。\n"
-        index_content = intro + "\n".join(dir_lines)
+            content = response.choices[0].message.content.strip()
 
-        index_page = self.page_manager.get_index(kb_id)
-        if index_page:
-            index_page.content = index_content
-            self.page_manager.update_page(index_page)
-        else:
-            self.page_manager.create_page(WikiPage(
-                knowledge_base_id=kb_id,
+            return WikiPage(
                 slug="index",
-                title="Wiki 索引",
-                page_type="index",
-                content=index_content,
-                summary="Wiki 知识库索引",
-            ))
+                title="知识库索引",
+                page_type=WikiPageType.INDEX,
+                content=content,
+                status="published",
+            )
 
-    def _inject_cross_links(self, kb_id: str, affected_slugs: list[str]):
-        """
-        注入交叉链接 (借鉴 WeKnora 的 injectCrossLinks)
-
-        扫描受影响页面，将内容中出现的其他 Wiki 页面标题
-        自动转换为 [[slug|显示名称]] 链接格式。
-        """
-        all_pages = self.page_manager.list_pages(kb_id)
-        if len(all_pages) < 2:
-            return
-
-        # 构建链接引用表
-        refs = []
-        for p in all_pages:
-            if p.page_type in ("index", "log"):
-                continue
-            if p.title:
-                refs.append((p.slug, p.title))
-            for alias in p.aliases:
-                if alias:
-                    refs.append((p.slug, alias))
-
-        # 按长度降序排列（优先匹配长名称）
-        refs.sort(key=lambda x: len(x[1]), reverse=True)
-
-        affected_set = set(affected_slugs)
-        updated = 0
-
-        for page in all_pages:
-            if page.slug not in affected_set:
-                continue
-            if page.page_type in ("index", "log"):
-                continue
-
-            new_content = page.content
-            changed = False
-
-            for slug, match_text in refs:
-                if slug == page.slug:
-                    continue  # 不自我链接
-
-                # 跳过已存在的链接
-                if f"[[{slug}" in new_content:
-                    continue
-
-                # 简单文本替换（不在代码块或已有链接中）
-                if match_text in new_content:
-                    # 排除已在 [[...]] 中的
-                    pattern = re.compile(
-                        r"(?<!\[\[)" + re.escape(match_text) + r"(?![\]\|])"
-                    )
-                    replacement = f"[[{slug}|{match_text}]]"
-                    new_content, count = pattern.subn(replacement, new_content, count=1)
-                    if count > 0:
-                        changed = True
-
-            if changed:
-                page.content = new_content
-                self.page_manager.update_page(page)
-                updated += 1
-
-        if updated > 0:
-            logger.info(f"[Wiki] 交叉链接注入: 更新了 {updated} 个页面")
-
-    def _get_available_slugs(self, kb_id: str) -> str:
-        """获取当前可用的 Wiki 页面 slug 列表"""
-        pages = self.page_manager.list_pages(kb_id)
-        if not pages:
-            return "(暂无 Wiki 页面)"
-
-        lines = []
-        for p in pages:
-            alias_str = f" (别名: {', '.join(p.aliases)})" if p.aliases else ""
-            lines.append(f"[[{p.slug}]] = {p.title}{alias_str}")
-        return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"重建索引页失败: {e}")
+            return None
 
     @staticmethod
-    def _split_summary_line(raw: str) -> tuple[str, str]:
-        """分离 SUMMARY 行和正文"""
-        raw = raw.strip()
-        if raw.startswith("SUMMARY:") or raw.startswith("SUMMARY："):
-            idx = raw.find("\n")
-            if idx < 0:
-                summary = raw.split(":", 1)[1].strip().split("：", 1)[-1].strip()
-                return summary, ""
-            summary_line = raw[:idx]
-            summary = summary_line.split(":", 1)[1].strip().split("：", 1)[-1].strip()
-            return summary, raw[idx + 1:].strip()
-        return "", raw
+    def _title_to_slug(title: str) -> str:
+        """将标题转换为 URL-friendly slug"""
+        # 转小写
+        slug = title.lower()
+        # 替换空格和特殊字符为连字符
+        slug = re.sub(r'[\s_]+', '-', slug)
+        # 只保留字母、数字、连字符和中文
+        slug = re.sub(r'[^\w\-\u4e00-\u9fff]', '', slug)
+        # 截断
+        slug = slug[:64]
+        return slug or "untitled"
 
     @staticmethod
-    def _slugify(text: str) -> str:
-        """将文本转换为 URL 友好的 slug"""
-        import unicodedata
-        import re
+    def _parse_json_list(text: str) -> List[dict]:
+        """解析 LLM 输出中的 JSON 列表"""
+        # 尝试提取 JSON 代码块
+        json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+        if json_match:
+            text = json_match.group(1)
 
-        # 对中文进行简单拼音化处理（这里用连字符替代）
-        text = text.lower().strip()
-        text = re.sub(r"[^\w\s-]", "", text)
-        text = re.sub(r"[\s_]+", "-", text)
-        text = text.strip("-")
-        return text or "untitled"
+        try:
+            result = json.loads(text.strip())
+            if isinstance(result, list):
+                return result
+            elif isinstance(result, dict):
+                return [result]
+        except json.JSONDecodeError:
+            pass
 
-    @staticmethod
-    def _format_items_for_dedup(entities: list[dict], concepts: list[dict]) -> str:
-        """格式化新提取项用于去重"""
-        lines = []
-        for item in entities:
-            lines.append(f'  <item slug="{item.get("slug", "")}" type="entity">')
-            lines.append(f'    <name>{item.get("name", "")}</name>')
-            for alias in item.get("aliases", []):
-                lines.append(f"    <alias>{alias}</alias>")
-            lines.append("  </item>")
-        for item in concepts:
-            lines.append(f'  <item slug="{item.get("slug", "")}" type="concept">')
-            lines.append(f'    <name>{item.get("name", "")}</name>')
-            for alias in item.get("aliases", []):
-                lines.append(f"    <alias>{alias}</alias>")
-            lines.append("  </item>")
-        return "\n".join(lines)
+        # 尝试更宽松的解析
+        try:
+            # 找到 [ 和 ] 的范围
+            start = text.find('[')
+            end = text.rfind(']')
+            if start >= 0 and end > start:
+                result = json.loads(text[start:end + 1])
+                if isinstance(result, list):
+                    return result
+        except json.JSONDecodeError:
+            pass
 
-    @staticmethod
-    def _format_existing_pages_for_dedup(pages: list[WikiPage]) -> str:
-        """格式化现有页面用于去重"""
-        lines = []
-        for p in pages:
-            lines.append(f'  <item slug="{p.slug}" type="{p.page_type}">')
-            lines.append(f"    <name>{p.title}</name>")
-            for alias in p.aliases:
-                lines.append(f"    <alias>{alias}</alias>")
-            lines.append("  </item>")
-        return "\n".join(lines)
+        logger.warning(f"无法解析 JSON 列表: {text[:200]}")
+        return []

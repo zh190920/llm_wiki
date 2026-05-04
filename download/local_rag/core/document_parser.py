@@ -1,198 +1,193 @@
 """
-文档解析器 — 支持多种格式
-================================
-借鉴 WeKnora 的 docparser 设计，支持 PDF/DOCX/TXT/MD/HTML 等
-常见文档格式的解析，输出统一的文本内容。
+文档解析模块 - 支持 PDF 和 Markdown 格式
+借鉴 WeKnora docreader 的设计思想，实现统一的文档解析接口
 """
-
-import os
+import asyncio
+import logging
+import re
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from loguru import logger
+from models.schemas import Chunk, DocumentMetadata
+
+logger = logging.getLogger(__name__)
 
 
-class DocumentParser:
-    """多格式文档解析器"""
+class BaseParser(ABC):
+    """文档解析器基类 - 定义统一接口"""
 
-    SUPPORTED_EXTENSIONS = {
-        ".pdf", ".docx", ".doc", ".txt", ".md", ".html", ".htm",
-        ".pptx", ".csv", ".xlsx", ".xls", ".json",
-    }
+    @abstractmethod
+    async def parse(self, file_path: str, doc_id: str) -> tuple[str, DocumentMetadata]:
+        """解析文档，返回 (纯文本内容, 文档元数据)"""
+        ...
 
-    @staticmethod
-    def is_supported(file_path: str) -> bool:
-        """检查文件格式是否支持"""
-        ext = Path(file_path).suffix.lower()
-        return ext in DocumentParser.SUPPORTED_EXTENSIONS
+    @abstractmethod
+    def supported_extensions(self) -> List[str]:
+        """支持的文件扩展名"""
+        ...
 
-    @staticmethod
-    async def parse(file_path: str) -> dict:
-        """
-        解析文档，返回统一格式的解析结果
 
-        Args:
-            file_path: 文件路径
+class PDFParser(BaseParser):
+    """
+    PDF 文档解析器
+    使用 PyMuPDF (fitz) 解析 PDF，提取文本并保留结构信息
+    """
 
-        Returns:
-            {
-                "title": str,
-                "content": str,
-                "file_type": str,
-                "file_name": str,
-                "file_size": int,
-                "metadata": dict,
-            }
-        """
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"文件不存在: {file_path}")
+    async def parse(self, file_path: str, doc_id: str) -> tuple[str, DocumentMetadata]:
+        """解析 PDF 文件，提取文本内容"""
+        try:
+            text_content = await asyncio.to_thread(self._parse_sync, file_path)
+        except Exception as e:
+            logger.error(f"PDF 解析失败: {file_path}, 错误: {e}")
+            raise
 
-        ext = path.suffix.lower()
-        file_name = path.name
-        file_size = path.stat().st_size
+        filename = Path(file_path).name
+        metadata = DocumentMetadata(
+            doc_id=doc_id,
+            filename=filename,
+            file_type="pdf",
+            title=Path(file_path).stem,
+            source=file_path,
+        )
+        return text_content, metadata
 
-        parsers = {
-            ".pdf": DocumentParser._parse_pdf,
-            ".docx": DocumentParser._parse_docx,
-            ".doc": DocumentParser._parse_docx,
-            ".txt": DocumentParser._parse_text,
-            ".md": DocumentParser._parse_text,
-            ".html": DocumentParser._parse_html,
-            ".htm": DocumentParser._parse_html,
-            ".pptx": DocumentParser._parse_pptx,
-            ".csv": DocumentParser._parse_csv,
-            ".xlsx": DocumentParser._parse_xlsx,
-            ".xls": DocumentParser._parse_xlsx,
-            ".json": DocumentParser._parse_json,
-        }
+    def _parse_sync(self, file_path: str) -> str:
+        """同步解析 PDF（在线程池中执行）"""
+        import fitz  # pymupdf
 
-        parser = parsers.get(ext)
-        if not parser:
-            raise ValueError(f"不支持的文件格式: {ext}")
+        doc = fitz.open(file_path)
+        pages_text = []
 
-        content = await parser(file_path)
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text("text")
 
-        # 从内容推断标题
-        title = DocumentParser._extract_title(content, file_name)
+            # 清理和格式化
+            text = self._clean_text(text)
 
-        return {
-            "title": title,
-            "content": content,
-            "file_type": ext.lstrip("."),
-            "file_name": file_name,
-            "file_size": file_size,
-            "metadata": {},
-        }
+            if text.strip():
+                # 添加页码标记，便于后续追溯
+                pages_text.append(f"[第 {page_num + 1} 页]\n{text}")
 
-    @staticmethod
-    async def _parse_pdf(file_path: str) -> str:
-        """解析 PDF 文件"""
-        import pypdf
+        doc.close()
+        return "\n\n".join(pages_text)
 
-        texts = []
-        with open(file_path, "rb") as f:
-            reader = pypdf.PdfReader(f)
-            for page in reader.pages:
-                text = page.extract_text()
-                if text:
-                    texts.append(text.strip())
-        return "\n\n".join(texts)
+    def _clean_text(self, text: str) -> str:
+        """清理 PDF 提取的文本"""
+        # 移除多余的空白行
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        # 移除行内多余空格
+        text = re.sub(r' +', ' ', text)
+        # 修复断行问题（中文不需要空格连接）
+        text = re.sub(r'(?<=[\u4e00-\u9fff])\n(?=[\u4e00-\u9fff])', '', text)
+        return text.strip()
 
-    @staticmethod
-    async def _parse_docx(file_path: str) -> str:
-        """解析 DOCX 文件"""
-        from docx import Document
+    def supported_extensions(self) -> List[str]:
+        return [".pdf"]
 
-        doc = Document(file_path)
-        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-        return "\n\n".join(paragraphs)
 
-    @staticmethod
-    async def _parse_text(file_path: str) -> str:
-        """解析纯文本/Markdown 文件"""
-        import aiofiles
+class MarkdownParser(BaseParser):
+    """
+    Markdown 文档解析器
+    保留 Markdown 结构信息（标题层级），便于语义分块
+    """
 
-        async with aiofiles.open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            return await f.read()
+    async def parse(self, file_path: str, doc_id: str) -> tuple[str, DocumentMetadata]:
+        """解析 Markdown 文件"""
+        try:
+            content = await asyncio.to_thread(self._parse_sync, file_path)
+        except Exception as e:
+            logger.error(f"Markdown 解析失败: {file_path}, 错误: {e}")
+            raise
 
-    @staticmethod
-    async def _parse_html(file_path: str) -> str:
-        """解析 HTML 文件"""
-        from bs4 import BeautifulSoup
+        filename = Path(file_path).name
+        metadata = DocumentMetadata(
+            doc_id=doc_id,
+            filename=filename,
+            file_type="markdown",
+            title=self._extract_title(content) or Path(file_path).stem,
+            source=file_path,
+        )
+        return content, metadata
 
-        import aiofiles
-        async with aiofiles.open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            html = await f.read()
-        soup = BeautifulSoup(html, "html.parser")
+    def _parse_sync(self, file_path: str) -> str:
+        """同步解析 Markdown"""
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return content
 
-        # 移除脚本和样式
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-
-        return soup.get_text(separator="\n", strip=True)
-
-    @staticmethod
-    async def _parse_pptx(file_path: str) -> str:
-        """解析 PPTX 文件"""
-        from pptx import Presentation
-
-        prs = Presentation(file_path)
-        texts = []
-        for slide in prs.slides:
-            slide_texts = []
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text.strip():
-                    slide_texts.append(shape.text.strip())
-            if slide_texts:
-                texts.append("\n".join(slide_texts))
-        return "\n\n---\n\n".join(texts)
-
-    @staticmethod
-    async def _parse_csv(file_path: str) -> str:
-        """解析 CSV 文件"""
-        import csv
-
-        rows = []
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                rows.append(" | ".join(row))
-        return "\n".join(rows)
-
-    @staticmethod
-    async def _parse_xlsx(file_path: str) -> str:
-        """解析 XLSX/XLS 文件"""
-        from openpyxl import load_workbook
-
-        wb = load_workbook(file_path, read_only=True)
-        texts = []
-        for ws in wb.worksheets:
-            for row in ws.iter_rows(values_only=True):
-                cells = [str(c) for c in row if c is not None]
-                if cells:
-                    texts.append(" | ".join(cells))
-        wb.close()
-        return "\n".join(texts)
-
-    @staticmethod
-    async def _parse_json(file_path: str) -> str:
-        """解析 JSON 文件"""
-        import json
-        import aiofiles
-
-        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-            content = await f.read()
-        data = json.loads(content)
-        return json.dumps(data, ensure_ascii=False, indent=2)
-
-    @staticmethod
-    def _extract_title(content: str, file_name: str) -> str:
-        """从内容中提取标题"""
-        for line in content.split("\n")[:5]:
+    def _extract_title(self, content: str) -> Optional[str]:
+        """从 Markdown 中提取第一个标题"""
+        for line in content.split("\n"):
             line = line.strip()
             if line.startswith("# "):
                 return line[2:].strip()
-            if line and len(line) < 100:
-                return line
-        return Path(file_name).stem
+        return None
+
+    def supported_extensions(self) -> List[str]:
+        return [".md", ".markdown"]
+
+
+class DocumentParser:
+    """
+    文档解析引擎 - 统一管理所有解析器
+    借鉴 WeKnora 的 engine_registry 设计，支持解析器注册和自动选择
+    """
+
+    def __init__(self):
+        self._parsers: dict[str, BaseParser] = {}
+        self._register_default_parsers()
+
+    def _register_default_parsers(self):
+        """注册默认解析器"""
+        for parser_cls in [PDFParser, MarkdownParser]:
+            parser = parser_cls()
+            for ext in parser.supported_extensions():
+                self._parsers[ext.lower()] = parser
+
+    def register_parser(self, extension: str, parser: BaseParser):
+        """注册自定义解析器（先注册优先）"""
+        ext = extension.lower()
+        if ext not in self._parsers:
+            self._parsers[ext] = parser
+        else:
+            logger.warning(f"解析器已存在: {ext}，跳过注册")
+
+    def get_parser(self, file_path: str) -> Optional[BaseParser]:
+        """根据文件扩展名获取解析器"""
+        ext = Path(file_path).suffix.lower()
+        return self._parsers.get(ext)
+
+    async def parse(self, file_path: str, doc_id: Optional[str] = None) -> tuple[str, DocumentMetadata]:
+        """
+        解析文档 - 自动选择合适的解析器
+
+        Args:
+            file_path: 文件路径
+            doc_id: 文档ID，如不提供则自动生成
+
+        Returns:
+            (文本内容, 文档元数据)
+        """
+        if doc_id is None:
+            doc_id = DocumentMetadata().doc_id
+
+        parser = self.get_parser(file_path)
+        if parser is None:
+            supported = ", ".join(self._parsers.keys())
+            raise ValueError(
+                f"不支持的文件类型: {Path(file_path).suffix}，"
+                f"当前支持: {supported}"
+            )
+
+        text, metadata = await parser.parse(file_path, doc_id)
+        logger.info(
+            f"文档解析完成: {metadata.filename}, "
+            f"文本长度={len(text)}, doc_id={doc_id}"
+        )
+        return text, metadata
+
+    def supported_extensions(self) -> List[str]:
+        """返回所有支持的文件扩展名"""
+        return list(self._parsers.keys())
