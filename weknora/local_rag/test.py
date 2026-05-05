@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 qa = LocalQA(api_key="")
 
 # 第一步：加载文档
-qa.load_file(r"E:\vs_git\19011157-SC_A19《H5U&Easy系列可编程逻辑控制器编程手册》.pdf")
+qa.load_file(r"E:\vs_git\**.pdf")
 # qa.load_directory("./docs/")
 
 # 第二步：构建知识图谱（构建后自动开启图增强检索）
