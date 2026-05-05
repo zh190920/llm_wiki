@@ -34,7 +34,7 @@ class Embedder:
             timeout=self.config.timeout,
         )
         self._cache: dict[str, List[float]] = {}
-        self._batch_size = 100  # OpenAI 建议的批量大小
+        self._batch_size = 64  # OpenAI 建议的批量大小
 
     @retry(
         stop=stop_after_attempt(3),

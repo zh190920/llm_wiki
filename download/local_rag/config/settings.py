@@ -13,11 +13,16 @@ from pydantic_settings import BaseSettings
 
 class LLMConfig(BaseSettings):
     """LLM 相关配置"""
-    api_key: str = Field(default="", alias="OPENAI_API_KEY")
-    base_url: str = Field(default="https://api.openai.com/v1", alias="OPENAI_BASE_URL")
-    chat_model: str = Field(default="gpt-4o-mini", alias="CHAT_MODEL")
-    embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
-    embedding_dim: int = Field(default=1536, alias="EMBEDDING_DIM")
+    api_key: str = ""
+    base_url: str = "https://api.siliconflow.cn/v1"
+    chat_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    embedding_model: str = "BAAI/bge-m3"
+    embedding_dim: int = 1024
+    # api_key: str = Field(default="", alias="OPENAI_API_KEY")
+    # base_url: str = Field(default="https://api.siliconflow.cn/v1", alias="OPENAI_BASE_URL")
+    # chat_model: str = Field(default="Qwen/Qwen3-30B-A3B-Instruct-2507", alias="CHAT_MODEL")
+    # embedding_model: str = Field(default="BAAI/bge-large-zh-v1.5", alias="EMBEDDING_MODEL")
+    # embedding_dim: int = Field(default=1024, alias="EMBEDDING_DIM")
     max_tokens: int = Field(default=4096)
     temperature: float = Field(default=0.3)
     timeout: float = Field(default=120.0)

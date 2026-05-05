@@ -32,7 +32,7 @@ class VectorStore:
     - 异步并发安全
     """
 
-    def __init__(self, config: Optional[RetrieverConfig] = None, dim: int = 1536):
+    def __init__(self, config: Optional[RetrieverConfig] = None, dim: int = 1024):
         self.config = config or RetrieverConfig()
         self.dim = dim
 

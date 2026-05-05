@@ -3,11 +3,11 @@
 
 # LLM 配置
 llm:
-  api_key: "${OPENAI_API_KEY}"     # 从环境变量读取
-  base_url: "https://api.openai.com/v1"
-  chat_model: "gpt-4o-mini"
-  embedding_model: "text-embedding-3-small"
-  embedding_dim: 1536
+  api_key: ""     # 从环境变量读取
+  base_url: "https://api.siliconflow.cn/v1"
+  chat_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  embedding_model: "BAAI/bge-m3"
+  embedding_dim: 1024
   max_tokens: 4096
   temperature: 0.3
   timeout: 120.0
@@ -41,14 +41,14 @@ wiki:
   max_concurrent_extractions: 4
   chunk_batch_size: 5
   debounce_seconds: 5.0
-  wiki_dir: "./wiki_output"
+  wiki_dir: "output/wiki"
 
 # 数据存储
-data_dir: "./data"
-vector_store_dir: "./data/vector_store"
-graph_store_path: "./data/knowledge_graph.json"
+data_dir: "output"
+vector_store_dir: "output/vector_store"
+graph_store_path: "output/knowledge_graph.json"
 
 # API 服务
 host: "0.0.0.0"
-port: 8000
+port: 5000
 workers: 4

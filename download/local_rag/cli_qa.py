@@ -75,8 +75,8 @@ class LocalQA:
         api_key: Optional[str] = None,
         base_url: str = "https://api.openai.com/v1",
         chat_model: str = "gpt-4o-mini",
-        embedding_model: str = "text-embedding-3-small",
-        embedding_dim: int = 1536,
+        embedding_model: str = "BAAI/bge-m3",
+        embedding_dim: int = 1024,
         chunk_size: int = 512,
         chunk_overlap: int = 64,
         top_k: int = 5,
@@ -440,7 +440,7 @@ def main():
     parser.add_argument("--api-key", type=str, default=None, help="OpenAI API Key")
     parser.add_argument("--base-url", type=str, default=None, help="OpenAI API 地址")
     parser.add_argument("--chat-model", type=str, default="gpt-4o-mini", help="聊天模型")
-    parser.add_argument("--embedding-model", type=str, default="text-embedding-3-small", help="嵌入模型")
+    parser.add_argument("--embedding-model", type=str, default="BAAI/bge-m3", help="嵌入模型")
     parser.add_argument("--chunk-size", type=int, default=512, help="分块大小")
     parser.add_argument("--top-k", type=int, default=5, help="检索结果数")
     parser.add_argument("--question", "-q", type=str, default=None, help="直接提问（不进入交互模式）")
