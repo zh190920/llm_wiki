@@ -8,8 +8,7 @@ qa = LocalQA(
 )
 
 # 加载文档
-qa.load_file(r"E:\vs_git\19011157-SC_A19《H5U&Easy系列可编程逻辑控制器编程手册》.pdf")
-# qa.load_file("技术文档.md")
+qa.load_file("技术文档.md")
 # qa.load_directory("./docs/")  # 也可加载整个目录
 
 # 问答
