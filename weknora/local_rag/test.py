@@ -1,7 +1,5 @@
-import logging
-
 from cli_qa import LocalQA
-
+import logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -9,39 +7,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+qa = LocalQA(
+    api_key="",
+    base_url="https://api.siliconflow.cn/v1",
+    chat_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    embedding_model="BAAI/bge-m3",
+    embedding_dim=1024,
+)
 
-qa = LocalQA(api_key="")
+# 加载文档
+# qa.load_file("操作手册.pdf")
+qa.load_directory(r"E:\vs_git\manual")
 
-# 第一步：加载文档
-qa.load_file(r"E:\vs_git\**.pdf")
-# qa.load_directory("./docs/")
+# 设置别名
+# qa._doc_router.set_aliases({
+#     "设备A": "XX型设备操作手册",
+#     "安全规程": "安全操作规程",
+#     "SOP": "标准操作流程",
+# })
 
-# 第二步：构建知识图谱（构建后自动开启图增强检索）
-# result = qa.build_graph()
-result = qa.load_graph()
-print(result)
-# 输出: {"entities": 45, "relationships": 32, "graph_enabled": True, 
-#        "message": "图谱构建完成: 45 个实体, 32 条关系，图增强检索已自动开启"}
+# 第一步：构建知识图谱（必须先执行，图谱才会注入到检索管线）
+# graph = qa.build_knowledge_graph()
+# print(f"实体数: {graph['entities']}, 关系数: {graph['relationships']}")
+# qa.save()
 
-# 开启
-# qa.enable_graph_search(True)
+# 第二步：使用图谱增强检索的问答
+# use_graph=True 启用三源RRF融合（向量+关键词+图谱）
+answer = qa.ask("xxx", use_graph=False, deep=True)
+print(answer)
 
-# # 关闭
-# qa.enable_graph_search(False)
+# 深度模式 + 图谱增强
+# answer = qa.ask("安全操作规程和设备维护有什么关系？", deep=True, use_graph=False)
+# print(answer)
 
-# status = qa.status()
-# print(status["graph"])
-# {'entities': 45, 'relationships': 32, 'graph_enabled': True}
-
-# 第三步：使用深度模式问答（图增强检索会自动生效）
-answer = qa.ask("easy520是否支持fins", deep=True)
-
-print("answer: ", answer)
-
-# 手动控制图增强检索开关
-qa.enable_graph_search(False)  # 关闭
-qa.enable_graph_search(True)   # 重新开启
-
-# 查看状态
-status = qa.status()
-print(status["graph"])  # {"entities": 45, "relationships": 32, "graph_enabled": True}
+# 带来源的图谱增强问答
+# result = qa.ask_with_sources("设备A的故障码E003和安全操作规程有什么关联？", use_graph=False)
+# print(result["answer"])
+# for src in result["sources"]:
+#     print(f"  来源: {src['section']}, 相关度: {src['score']}, 匹配类型: {src['match_type']}")

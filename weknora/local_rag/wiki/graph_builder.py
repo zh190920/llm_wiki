@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -66,7 +67,6 @@ class KnowledgeGraphBuilder:
         if not chunks:
             return KnowledgeGraph()
 
-        chunks = chunks[500:510]  # 限制处理前100个块，避免过大文档导致API调用过多
         logger.info(f"开始构建知识图谱: {len(chunks)} 个块")
 
         # Step 1: 并发实体提取
@@ -156,7 +156,7 @@ class KnowledgeGraphBuilder:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.1,
-                    max_tokens=5000,
+                    max_tokens=1000,
                 )
 
                 result_text = response.choices[0].message.content.strip()
@@ -219,7 +219,7 @@ class KnowledgeGraphBuilder:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.1,
-                    max_tokens=10000,
+                    max_tokens=1000,
                 )
 
                 result_text = response.choices[0].message.content.strip()
@@ -423,3 +423,137 @@ class KnowledgeGraphBuilder:
                 except json.JSONDecodeError:
                     pass
         return {}
+
+    def save(self, directory: str) -> str:
+        """
+        保存图谱数据到磁盘
+
+        保存三个文件：
+        1. graph_entities.json  — 实体列表（含 entity_id, title, description, type, frequency, source_chunk_ids）
+        2. graph_relationships.json — 关系列表（含 source_entity_id, target_entity_id, relation_type, weight 等）
+        3. graph_chunk_entities.json — chunk_id → [entity_titles] 映射（用于恢复 _chunk_entities）
+
+        Args:
+            directory: 保存目录
+
+        Returns:
+            保存路径
+        """
+        save_dir = Path(directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. 保存实体
+        entities_data = {}
+        for title, entity in self._entity_map.items():
+            entities_data[title] = entity.model_dump()
+
+        entities_path = save_dir / "graph_entities.json"
+        with open(entities_path, "w", encoding="utf-8") as f:
+            json.dump(entities_data, f, ensure_ascii=False, indent=2)
+
+        # 2. 保存关系（从 NetworkX 图中提取，确保权重等已计算）
+        relationships_data = []
+        for u, v, data in self._graph.edges(data=True):
+            relationships_data.append({
+                "source_entity_id": u,
+                "target_entity_id": v,
+                "relation_type": data.get("relation_type", ""),
+                "description": data.get("description", ""),
+                "weight": data.get("weight", 1.0),
+            })
+
+        rels_path = save_dir / "graph_relationships.json"
+        with open(rels_path, "w", encoding="utf-8") as f:
+            json.dump(relationships_data, f, ensure_ascii=False, indent=2)
+
+        # 3. 保存 chunk_entities 映射
+        chunk_entities_data = dict(self._chunk_entities)
+        chunk_entities_path = save_dir / "graph_chunk_entities.json"
+        with open(chunk_entities_path, "w", encoding="utf-8") as f:
+            json.dump(chunk_entities_data, f, ensure_ascii=False, indent=2)
+
+        logger.info(
+            f"知识图谱已保存到 {directory}: "
+            f"{len(self._entity_map)} 个实体, {len(relationships_data)} 条关系"
+        )
+        return str(save_dir)
+
+    def load(self, directory: str) -> bool:
+        """
+        从磁盘加载图谱数据并恢复内部状态
+
+        恢复内容：
+        1. _entity_map: title → Entity 映射
+        2. _chunk_entities: chunk_id → [entity_titles] 映射
+        3. _graph: NetworkX DiGraph（从实体和关系重建）
+
+        恢复后可立即用于：
+        - get_related_chunks() 图谱遍历检索
+        - search_graph() 图谱增强检索
+        - 三源 RRF 融合
+        - Mermaid 可视化
+
+        Args:
+            directory: 图谱数据所在目录
+
+        Returns:
+            是否成功加载
+        """
+        load_dir = Path(directory)
+
+        entities_path = load_dir / "graph_entities.json"
+        rels_path = load_dir / "graph_relationships.json"
+        chunk_entities_path = load_dir / "graph_chunk_entities.json"
+
+        if not entities_path.exists():
+            logger.info(f"图谱数据不存在，跳过恢复: {entities_path}")
+            return False
+
+        try:
+            # 1. 恢复实体
+            with open(entities_path, "r", encoding="utf-8") as f:
+                entities_data = json.load(f)
+
+            self._entity_map = {}
+            for title, entity_dict in entities_data.items():
+                self._entity_map[title] = Entity(**entity_dict)
+
+            # 2. 恢复关系
+            relationships: List[Relationship] = []
+            if rels_path.exists():
+                with open(rels_path, "r", encoding="utf-8") as f:
+                    relationships_data = json.load(f)
+                for rel_dict in relationships_data:
+                    relationships.append(Relationship(**rel_dict))
+
+            # 3. 恢复 chunk_entities 映射
+            if chunk_entities_path.exists():
+                with open(chunk_entities_path, "r", encoding="utf-8") as f:
+                    self._chunk_entities = defaultdict(list, json.load(f))
+            else:
+                # 从实体数据反向构建 chunk_entities
+                self._chunk_entities = defaultdict(list)
+                for title, entity in self._entity_map.items():
+                    for chunk_id in entity.source_chunk_ids:
+                        self._chunk_entities[chunk_id].append(title)
+
+            # 4. 重建 NetworkX 图结构
+            self._graph = nx.DiGraph()
+            self._build_networkx_graph(relationships)
+
+            logger.info(
+                f"知识图谱已从 {directory} 恢复: "
+                f"{len(self._entity_map)} 个实体, "
+                f"{self._graph.number_of_edges()} 条关系, "
+                f"{len(self._chunk_entities)} 个chunk映射"
+            )
+            return True
+
+        except Exception as e:
+            logger.warning(f"加载知识图谱失败（不影响正常使用）: {e}")
+            return False
+
+    @property
+    def has_data(self) -> bool:
+        """图谱是否包含数据"""
+        return len(self._entity_map) > 0 and self._graph.number_of_nodes() > 0

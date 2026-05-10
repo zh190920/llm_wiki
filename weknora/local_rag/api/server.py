@@ -1,9 +1,14 @@
 """
 FastAPI 服务层 - 异步高并发接口
 提供 RAG 问答、Agent 推理、Wiki 生成、文档管理等 REST API
+
+核心设计：所有检索模式都先进行文档级预筛选
+- 快速问答：先路由 → 在匹配文档子空间中检索
+- 深度问答：先路由 → 查询理解 → 在匹配文档子空间中检索 → 重排
+- Agent 模式：先路由 → 传递匹配范围给知识检索工具
+- Wiki 模式：先路由 → 在匹配文档的 Wiki 页面中检索
 """
 import asyncio
-import json
 import logging
 import os
 import uuid
@@ -17,12 +22,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from config.settings import AppConfig, load_config
 from core.chunker import TextChunker
+from core.doc_router import DocRouter
 from core.document_parser import DocumentParser
 from core.embedder import Embedder
 from core.rag_engine import RAGEngine
 from core.reranker import Reranker
 from core.retriever import Retriever
-from core.session_manager import SessionManager
 from core.vector_store import VectorStore
 from agent.engine import AgentEngine
 from models.schemas import (
@@ -38,6 +43,7 @@ from wiki.page_manager import WikiPageManager
 
 logger = logging.getLogger(__name__)
 
+
 # ============================================================
 # 全局状态管理
 # ============================================================
@@ -52,21 +58,14 @@ class AppState:
         self.chunker = TextChunker(config.chunker)
         self.embedder = Embedder(config.llm)
         self.vector_store = VectorStore(config.retriever, dim=config.llm.embedding_dim)
-        self.graph_builder = KnowledgeGraphBuilder(config)
         self.reranker = Reranker(config.llm, config.retriever, self.embedder)
-        self.retriever = Retriever(
-            config, self.vector_store, self.embedder, self.reranker,
-            graph_builder=self.graph_builder,  # 注入图构建器
-        )
+        self.retriever = Retriever(config, self.vector_store, self.embedder, self.reranker)
         self.rag_engine = RAGEngine(config)
         self.agent_engine = AgentEngine(config)
         self.wiki_manager = WikiPageManager(config.wiki.wiki_dir)
         self.wiki_ingest = WikiIngest(config, self.wiki_manager)
-
-        # 会话管理器
-        self.session_manager = SessionManager(
-            workspace=os.path.join(config.data_dir, "sessions"),
-        )
+        self.graph_builder = KnowledgeGraphBuilder(config)
+        self.doc_router = DocRouter()
 
         # 文档注册表
         self._documents: Dict[str, dict] = {}  # doc_id -> metadata
@@ -74,9 +73,6 @@ class AppState:
 
         # 知识库注册表
         self._knowledge_bases: Dict[str, dict] = {}  # kb_id -> info
-
-        # 持久化文件路径
-        self._metadata_path = os.path.join(config.data_dir, "document_metadata.json")
 
     async def initialize(self):
         """初始化所有组件"""
@@ -92,10 +88,11 @@ class AppState:
             reranker=self.reranker,
         )
 
-        # 注册 Agent 工具
-        self.agent_engine.register_knowledge_tools(self.retriever, self.vector_store)
+        # 注册 Agent 工具（传入 doc_router 实现自动文档路由）
+        self.agent_engine.register_knowledge_tools(
+            self.retriever, self.vector_store, doc_router=self.doc_router
+        )
         self.agent_engine.register_wiki_tools(self.wiki_manager, self.vector_store)
-        self.agent_engine.register_graph_tools(self.graph_builder, self.vector_store)
 
         # 初始化 Wiki 管理器
         await self.wiki_manager.initialize()
@@ -104,38 +101,43 @@ class AppState:
         if os.path.exists(self.config.vector_store_dir):
             try:
                 await self.vector_store.load(self.config.vector_store_dir)
+                # 恢复文档路由器注册
+                self._restore_doc_router()
             except Exception as e:
                 logger.warning(f"加载向量存储失败: {e}")
 
-        # 加载文档元数据
-        self._load_document_metadata()
-
         logger.info("应用状态初始化完成")
 
-    def _load_document_metadata(self):
-        """从磁盘加载文档元数据"""
-        if os.path.exists(self._metadata_path):
-            try:
-                with open(self._metadata_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self._documents = data.get("documents", {})
-                self._doc_chunks = data.get("doc_chunks", {})
-                logger.info(f"加载 {len(self._documents)} 个文档元数据")
-            except Exception as e:
-                logger.error(f"加载文档元数据失败: {e}")
+    def _restore_doc_router(self):
+        """从已有的文档元数据和向量存储中恢复文档路由器"""
+        for doc_id, meta in self._documents.items():
+            self.doc_router.register_document(
+                doc_id=doc_id,
+                filename=meta.get("filename", ""),
+                title=meta.get("title", ""),
+            )
+        logger.info(f"文档路由器已恢复: {len(self._documents)} 个文档")
 
-    def _save_document_metadata(self):
-        """持久化文档元数据到磁盘"""
-        try:
-            os.makedirs(os.path.dirname(self._metadata_path), exist_ok=True)
-            data = {
-                "documents": self._documents,
-                "doc_chunks": self._doc_chunks,
-            }
-            with open(self._metadata_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"保存文档元数据失败: {e}")
+    def route_query(self, query: str) -> Optional[List[str]]:
+        """
+        文档路由：根据查询关键词匹配相关文档
+
+        返回匹配的 doc_id 列表。如果无匹配，返回 None（表示全量检索）。
+        如果只有一个文档，也返回 None（无需路由）。
+        """
+        if len(self._documents) <= 1:
+            return None
+
+        routed = self.doc_router.route(query)
+        if routed:
+            logger.info(
+                f"文档路由: 查询='{query[:50]}' → 匹配 {len(routed)}/{len(self._documents)} 个文档: "
+                f"{[self._documents[did].get('filename', did) for did in routed[:5]]}"
+            )
+            return routed
+        else:
+            logger.info(f"文档路由: 查询='{query[:50]}' → 无匹配，使用全量检索")
+            return None
 
     def get_kb_info(self) -> List[dict]:
         """获取知识库信息（供 Agent 提示词使用）"""
@@ -148,6 +150,7 @@ class AppState:
                     "description": "所有已上传文档",
                     "doc_count": doc_count,
                     "chunk_count": chunk_count,
+                    "doc_names": [meta.get("filename", "") for meta in self._documents.values()],
                 }]
             return []
 
@@ -184,7 +187,6 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
         # 清理
         try:
             await state.vector_store.save(config.vector_store_dir)
-            state._save_document_metadata()
         except Exception as e:
             logger.error(f"保存向量存储失败: {e}")
         logger.info("应用已关闭")
@@ -235,7 +237,7 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
             text, metadata = await state.parser.parse(str(file_path), doc_id)
             metadata.chunk_count = 0
 
-            # 分块（支持层级分块）
+            # 分块
             chunks = state.chunker.chunk_text(text, doc_id, metadata.file_type)
             if not chunks:
                 return UploadResponse(
@@ -254,11 +256,17 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
             # 持久化
             await state.vector_store.save(config.vector_store_dir)
 
-            # 更新元数据并持久化
+            # 更新元数据
             metadata.chunk_count = len(chunks)
             state._documents[doc_id] = metadata.model_dump()
             state._doc_chunks[doc_id] = [c.chunk_id for c in chunks]
-            state._save_document_metadata()
+
+            # 注册到文档路由器
+            state.doc_router.register_document(
+                doc_id=doc_id,
+                filename=metadata.filename,
+                title=metadata.title,
+            )
 
             return UploadResponse(
                 doc_id=doc_id,
@@ -296,13 +304,13 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
         if doc_id in state._doc_chunks:
             del state._doc_chunks[doc_id]
 
-        # 持久化元数据变更
-        state._save_document_metadata()
+        # 从文档路由器中移除
+        state.doc_router.unregister_document(doc_id)
 
         return {"message": f"已删除文档 {doc_id}，移除 {count} 个块"}
 
     # ============================================================
-    # RAG 问答 API
+    # RAG 问答 API - 所有模式都先进行文档级预筛选
     # ============================================================
 
     @app.post("/api/chat", response_model=ChatResponse)
@@ -310,38 +318,61 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
         """
         统一聊天接口
 
-        支持三种模式：
+        所有模式都先进行文档路由预筛选：
+        1. 根据用户查询关键词匹配文档名
+        2. 确定检索范围（匹配的文档列表）
+        3. 在确定范围内执行检索
+
+        支持四种模式：
         - rag: RAG 快速问答
+        - deep: 深度问答（查询理解+重排）
         - agent: ReAct Agent 智能推理
         - wiki: Wiki 知识库查询
         """
         try:
-            # 获取或创建会话
-            session = state.session_manager.get_or_create_session(
-                conversation_id=request.conversation_id
-            )
-            conversation_id = session.conversation_id
+            # ========================================
+            # 文档路由：所有模式都先确定检索的手册范围
+            # ========================================
+            doc_ids = None  # None 表示全量检索
 
-            # 获取对话历史
-            conversation_history = session.get_history(max_turns=3)
+            # 如果用户手动指定了文档范围，优先使用
+            if request.document_ids:
+                doc_ids = request.document_ids
+                logger.info(f"用户指定文档范围: {doc_ids}")
+            else:
+                # 自动文档路由
+                doc_ids = state.route_query(request.query)
 
             if request.mode == "agent":
-                # Agent 模式
+                # ========================================
+                # Agent 模式：传递文档路由结果给知识检索工具
+                # ========================================
+                # Agent 的 KnowledgeSearchTool 已内置 doc_router，
+                # 但这里额外把路由结果传入 kb_info，让 Agent 知道应该搜索哪些文档
                 kb_info = state.get_kb_info()
+                # 将路由结果附加到 kb_info
+                if doc_ids and kb_info:
+                    kb_info[0]["routed_doc_ids"] = doc_ids
+                    kb_info[0]["routed_doc_names"] = [
+                        state._documents[did].get("filename", did)
+                        for did in doc_ids if did in state._documents
+                    ]
+
                 response = await state.agent_engine.run(
                     query=request.query,
                     knowledge_bases_info=kb_info if kb_info else None,
-                    conversation_history=conversation_history,
                 )
-                response.conversation_id = conversation_id
-
-                # 追加到会话
-                session.add_message("user", request.query)
-                session.add_message("assistant", response.answer)
+                return response
 
             elif request.mode == "wiki":
-                # Wiki 模式：在 Wiki 知识库中检索
-                wiki_pages = await state.wiki_manager.search_pages(request.query)
+                # ========================================
+                # Wiki 模式：在匹配文档的 Wiki 页面中检索
+                # ========================================
+                # 先在 Wiki 页面中搜索，如果指定了 doc_ids 则只搜索来自这些文档的页面
+                wiki_pages = await state.wiki_manager.search_pages(
+                    request.query,
+                    doc_ids=doc_ids,
+                )
                 if wiki_pages:
                     context = "\n\n---\n\n".join([
                         f"# {p.title}\n{p.content}" for p in wiki_pages[:3]
@@ -361,42 +392,27 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
                     answer = await state.rag_engine._generate_answer(
                         request.query, context
                     )
-                    response = ChatResponse(
-                        answer=answer,
-                        sources=results,
-                        conversation_id=conversation_id,
-                    )
-
-                    # 追加到会话
-                    session.add_message("user", request.query)
-                    session.add_message("assistant", answer)
+                    return ChatResponse(answer=answer, sources=results)
                 else:
-                    response = ChatResponse(
-                        answer="Wiki 知识库中暂无相关内容。",
-                        conversation_id=conversation_id,
-                    )
+                    return ChatResponse(answer="Wiki 知识库中暂无相关内容。")
 
             else:
-                # RAG 快速问答（默认）
-                if request.query and len(request.query) > 50:
-                    # 长查询使用深度模式
+                # ========================================
+                # RAG 问答模式（默认 + deep）：在匹配文档子空间中检索
+                # ========================================
+                is_deep = request.mode == "deep" or (request.query and len(request.query) > 50)
+
+                if is_deep:
                     response = await state.rag_engine.deep_chat(
                         request.query,
-                        conversation_id=conversation_id,
+                        doc_ids=doc_ids,
                     )
                 else:
                     response = await state.rag_engine.quick_chat(
                         request.query,
-                        conversation_id=conversation_id,
+                        doc_ids=doc_ids,
                     )
-
-                response.conversation_id = conversation_id
-
-                # 追加到会话
-                session.add_message("user", request.query)
-                session.add_message("assistant", response.answer)
-
-            return response
+                return response
 
         except Exception as e:
             logger.error(f"聊天处理失败: {e}")
@@ -405,25 +421,34 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
     @app.post("/api/chat/stream")
     async def chat_stream(request: ChatRequest):
         """流式聊天接口（SSE）"""
+        # 文档路由
+        doc_ids = None
+        if request.document_ids:
+            doc_ids = request.document_ids
+        else:
+            doc_ids = state.route_query(request.query)
+
         async def generate():
             try:
-                # 获取会话历史
-                session = state.session_manager.get_or_create_session(
-                    conversation_id=request.conversation_id
-                )
-                conversation_history = session.get_history(max_turns=3)
-
                 if request.mode == "agent":
+                    kb_info = state.get_kb_info()
+                    if doc_ids and kb_info:
+                        kb_info[0]["routed_doc_ids"] = doc_ids
+                        kb_info[0]["routed_doc_names"] = [
+                            state._documents[did].get("filename", did)
+                            for did in doc_ids if did in state._documents
+                        ]
                     async for chunk in state.agent_engine.stream_run(
                         query=request.query,
-                        knowledge_bases_info=state.get_kb_info() or None,
+                        knowledge_bases_info=kb_info or None,
                     ):
                         yield f"data: {chunk}\n\n"
                 else:
+                    is_deep = request.mode == "deep" or len(request.query) > 50
                     async for chunk in state.rag_engine.stream_chat(
                         query=request.query,
-                        deep=len(request.query) > 50,
-                        conversation_history=conversation_history,
+                        deep=is_deep,
+                        doc_ids=doc_ids,
                     ):
                         yield f"data: {chunk}\n\n"
                 yield "data: [DONE]\n\n"
@@ -490,6 +515,7 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
                     "type": p.page_type.value,
                     "status": p.status,
                     "out_links": p.out_links,
+                    "source_doc_ids": p.source_doc_ids,
                     "updated_at": p.updated_at,
                 }
                 for p in pages
@@ -579,7 +605,6 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
             "wiki_pages": state.wiki_manager.total_pages,
             "graph_entities": len(state.graph_builder._entity_map),
             "graph_relationships": state.graph_builder._graph.number_of_edges(),
-            "sessions": len(state.session_manager._sessions),
         }
 
     @app.get("/api/system/tools")
@@ -596,42 +621,24 @@ def create_app(config: Optional[AppConfig] = None) -> FastAPI:
             ]
         }
 
-    # ============================================================
-    # 提示词管理 API
-    # ============================================================
+    @app.post("/api/system/route")
+    async def route_query(query: str = Query(..., description="查询文本")):
+        """文档路由调试接口：测试查询会被路由到哪些文档"""
+        routed = state.doc_router.route(query)
+        routing_info = state.doc_router.get_routing_info()
+        return {
+            "query": query,
+            "routed_doc_ids": routed,
+            "routed_count": len(routed),
+            "total_documents": len(state._documents),
+            "routing_info": routing_info,
+        }
 
-    @app.get("/api/system/prompts")
-    async def list_prompts():
-        """列出所有提示词模板"""
-        try:
-            from agent.prompts import _get_template_manager
-            manager = _get_template_manager()
-            return {"templates": manager.list_templates()}
-        except Exception as e:
-            return {"error": str(e)}
-
-    @app.put("/api/system/prompts/{name}")
-    async def update_prompt(name: str, template: dict):
-        """更新提示词模板"""
-        try:
-            from agent.prompts import _get_template_manager
-            manager = _get_template_manager()
-            manager.set_prompt(name, template.get("template", ""))
-            return {"message": f"提示词模板 '{name}' 已更新"}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.delete("/api/system/prompts/{name}")
-    async def reset_prompt(name: str):
-        """重置提示词模板为默认值"""
-        try:
-            from agent.prompts import _get_template_manager
-            manager = _get_template_manager()
-            if manager.reset_prompt(name):
-                return {"message": f"提示词模板 '{name}' 已重置"}
-            return {"message": f"提示词模板 '{name}' 无自定义覆盖"}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+    @app.post("/api/system/aliases")
+    async def set_aliases(aliases: Dict[str, str]):
+        """设置文档别名映射"""
+        state.doc_router.set_aliases(aliases)
+        return {"message": f"已设置 {len(aliases)} 个别名映射", "aliases": aliases}
 
     return app
 

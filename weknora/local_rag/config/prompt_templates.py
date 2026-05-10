@@ -34,9 +34,16 @@ class PromptTemplateManager:
             overrides_path: 自定义覆盖持久化路径
         """
         if templates_path is None:
-            # 自动查找模板文件
-            default_path = Path(__file__).parent / "prompt_templates.yaml"
-            templates_path = str(default_path) if default_path.exists() else None
+            # 自动查找模板文件（多路径搜索）
+            search_paths = [
+                Path(__file__).parent / "prompt_templates.yaml",       # config/ 目录
+                Path(__file__).parent.parent / "agent" / "prompt_templates.yaml",  # agent/ 目录
+                Path(__file__).parent.parent / "prompt_templates.yaml",  # 项目根目录
+            ]
+            for p in search_paths:
+                if p.exists():
+                    templates_path = str(p)
+                    break
 
         self._templates_path = templates_path
         self._overrides_path = overrides_path or os.path.join(

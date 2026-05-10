@@ -35,7 +35,6 @@ class Chunk(BaseModel):
     index: int = 0  # 在文档中的顺序
     metadata: Dict[str, Any] = Field(default_factory=dict)
     token_count: int = 0
-    parent_chunk_id: Optional[str] = None  # 父块 ID（层级分块时使用）
 
 
 # ============================================================
@@ -63,9 +62,7 @@ class SearchParams(BaseModel):
     top_k: int = 10
     similarity_threshold: float = 0.5
     match_types: List[MatchType] = Field(default_factory=lambda: [MatchType.VECTOR, MatchType.KEYWORD])
-    similarity_threshold_override: Optional[float] = None  # 单次查询的相似度阈值覆盖
-    rerank_threshold: Optional[float] = None  # 重排阈值
-    max_context_turns: int = 3  # 最大上下文轮次
+    doc_ids: Optional[List[str]] = None  # 限定检索范围的文档 ID 列表（None 表示全量检索）
 
 
 # ============================================================
@@ -194,7 +191,6 @@ class ChatResponse(BaseModel):
     sources: List[SearchResult] = Field(default_factory=list)
     agent_steps: List[AgentStep] = Field(default_factory=list)
     conversation_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
-    recommended_questions: List[str] = Field(default_factory=list)
 
 
 class UploadResponse(BaseModel):

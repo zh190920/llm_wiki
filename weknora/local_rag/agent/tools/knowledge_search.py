@@ -1,9 +1,9 @@
 """
 知识检索工具 - Agent 使用的核心检索工具
 """
+import json
 import logging
-import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from agent.tool_registry import Tool
 from models.schemas import SearchResult
@@ -19,10 +19,12 @@ class KnowledgeSearchTool(Tool):
     - 语义搜索：基于向量相似度检索
     - 关键词搜索：基于 BM25 的关键词检索
     - 混合搜索：融合两种检索方式
+    - 文档路由：只搜索与查询相关的文档
     """
 
-    def __init__(self, retriever):
+    def __init__(self, retriever, doc_router=None):
         self._retriever = retriever
+        self._doc_router = doc_router  # 文档路由器（可选）
 
     @property
     def name(self) -> str:
@@ -54,6 +56,11 @@ class KnowledgeSearchTool(Tool):
                     "type": "integer",
                     "description": "返回结果数量，默认5",
                 },
+                "doc_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "限定搜索的文档ID列表（可选，不填则自动路由到相关文档）",
+                },
             },
             "required": ["query"],
         }
@@ -62,6 +69,22 @@ class KnowledgeSearchTool(Tool):
         query = arguments["query"]
         search_type = arguments.get("search_type", "hybrid")
         top_k = arguments.get("top_k", 5)
+        doc_ids = arguments.get("doc_ids")
+
+        # 文档路由预筛选：如果没有手动指定 doc_ids，则尝试自动路由
+        # 这是"先确定检索手册范围，再在范围内检索"的第一步
+        if doc_ids is None and self._doc_router is not None:
+            routed = self._doc_router.route(query)
+            if routed:
+                doc_ids = routed
+                logger.info(
+                    f"知识检索工具 - 文档路由预筛选: 查询='{query[:50]}' → "
+                    f"匹配 {len(doc_ids)} 个文档，将在这些文档的子空间中检索"
+                )
+            else:
+                logger.info(f"知识检索工具 - 文档路由预筛选: 查询='{query[:50]}' → 无匹配，全量检索")
+        elif doc_ids:
+            logger.info(f"知识检索工具 - 手动指定文档范围: {len(doc_ids)} 个文档")
 
         from models.schemas import MatchType, SearchParams
 
@@ -76,6 +99,7 @@ class KnowledgeSearchTool(Tool):
             query=query,
             top_k=top_k,
             match_types=match_types,
+            doc_ids=doc_ids,
         )
 
         results = await self._retriever.retrieve(params, use_query_understanding=False, use_rerank=False)
@@ -101,20 +125,13 @@ class KnowledgeSearchTool(Tool):
 
 class GrepChunksTool(Tool):
     """
-    正则搜索工具 - 在文档块中进行正则表达式匹配
+    关键词搜索工具 - 在文档块中进行精确关键词匹配
 
-    借鉴 WeKnora 的 grep_chunks 工具，升级支持：
-    - 完整正则表达式支持
-    - 多模式同时搜索（最多5个）
-    - 匹配片段上下文展示（前后各60字符）
-    - 每个模式的命中计数
-    - already_seen 跨调用跟踪（避免重复结果）
-    - MMR 多样性去重（结果>10时使用 Jaccard 相似度）
+    借鉴 WeKnora 的 grep_chunks 工具
     """
 
     def __init__(self, vector_store):
         self._vector_store = vector_store
-        self._already_seen: Set[str] = set()  # 跨调用已见 chunk_id 集合
 
     @property
     def name(self) -> str:
@@ -123,10 +140,9 @@ class GrepChunksTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "在文档块中进行正则表达式搜索。"
-            "支持多个搜索模式（最多5个），返回匹配片段及上下文。"
-            "比语义搜索更精确，适合查找专有名词、代码片段、特定格式内容等。"
-            "支持 Python 正则表达式语法。"
+            "在文档块中进行精确关键词/短语搜索。"
+            "当需要精确查找包含特定关键词或短语的文档内容时使用此工具。"
+            "比语义搜索更精确，适合查找专有名词、代码片段等。"
         )
 
     @property
@@ -134,11 +150,9 @@ class GrepChunksTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "patterns": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "要搜索的正则表达式模式列表（最多5个）",
-                    "maxItems": 5,
+                "keyword": {
+                    "type": "string",
+                    "description": "要搜索的关键词或短语",
                 },
                 "doc_id": {
                     "type": "string",
@@ -148,176 +162,38 @@ class GrepChunksTool(Tool):
                     "type": "integer",
                     "description": "返回结果数量，默认10",
                 },
-                "reset_seen": {
-                    "type": "boolean",
-                    "description": "是否重置已见记录（默认false），用于开始新的搜索任务时清除之前的跟踪",
-                },
             },
-            "required": ["patterns"],
+            "required": ["keyword"],
         }
 
     async def execute(self, arguments: Dict[str, Any]) -> str:
-        patterns = arguments["patterns"]
+        keyword = arguments["keyword"]
         doc_id = arguments.get("doc_id")
         top_k = arguments.get("top_k", 10)
-        reset_seen = arguments.get("reset_seen", False)
 
-        # 重置已见记录
-        if reset_seen:
-            self._already_seen.clear()
-
-        # 限制模式数量
-        if len(patterns) > 5:
-            patterns = patterns[:5]
-            logger.warning("搜索模式超过5个，已截断为前5个")
-
-        # 编译正则表达式
-        compiled_patterns = []
-        for p in patterns:
-            try:
-                compiled_patterns.append(re.compile(p, re.IGNORECASE))
-            except re.error as e:
-                return f"正则表达式错误 '{p}': {e}"
-
-        # 在所有块中搜索
+        # 在所有块中搜索关键词
         chunks = self._vector_store._chunks
         if doc_id:
             chunks = [c for c in chunks if c.doc_id == doc_id]
 
-        # 搜索匹配
-        match_results: List[dict] = []  # {chunk, snippets, hit_counts}
+        results = []
+        keyword_lower = keyword.lower()
         for chunk in chunks:
-            hit_counts: Dict[str, int] = {}
-            snippets: List[str] = []
+            if keyword_lower in chunk.content.lower():
+                results.append(chunk)
+                if len(results) >= top_k:
+                    break
 
-            for i, pattern in enumerate(compiled_patterns):
-                matches = list(pattern.finditer(chunk.content))
-                if matches:
-                    hit_counts[patterns[i]] = len(matches)
-                    # 提取匹配片段及上下文
-                    for m in matches:
-                        start = max(0, m.start() - 60)
-                        end = min(len(chunk.content), m.end() + 60)
-                        context = chunk.content[start:end]
-                        # 标记匹配部分
-                        prefix = "..." if start > 0 else ""
-                        suffix = "..." if end < len(chunk.content) else ""
-                        snippet = f"{prefix}{context}{suffix}"
-                        snippets.append(snippet)
+        if not results:
+            return f"未找到包含 '{keyword}' 的内容。"
 
-            if hit_counts:
-                # 检查是否已见过
-                is_new = chunk.chunk_id not in self._already_seen
-                match_results.append({
-                    "chunk": chunk,
-                    "snippets": snippets,
-                    "hit_counts": hit_counts,
-                    "is_new": is_new,
-                })
-                self._already_seen.add(chunk.chunk_id)
-
-        if not match_results:
-            return f"未找到匹配 '{', '.join(patterns)}' 的内容。"
-
-        # MMR 多样性去重（结果 > 10 时）
-        if len(match_results) > 10:
-            match_results = self._mmr_diversify(match_results, top_k)
-
-        # 格式化输出
         parts = []
-        for i, result in enumerate(match_results[:top_k]):
-            chunk = result["chunk"]
-            new_flag = " [新]" if result["is_new"] else ""
-            hit_info = ", ".join(
-                f"'{p}': {cnt}次" for p, cnt in result["hit_counts"].items()
-            )
-            snippet_text = "\n  ".join(result["snippets"][:5])  # 最多显示5个片段
+        for i, chunk in enumerate(results):
+            # 高亮关键词位置
+            content = chunk.content
+            parts.append(f"[结果{i+1}] (文档: {chunk.doc_id})\n{content[:500]}")
 
-            parts.append(
-                f"[结果{i+1}]{new_flag} (文档: {chunk.doc_id}, 命中: {hit_info})\n"
-                f"  {snippet_text}"
-            )
-
-        # 汇总信息
-        total_hits = sum(
-            sum(r["hit_counts"].values()) for r in match_results
-        )
-        summary = (
-            f"搜索完成: {len(match_results)} 个块匹配, "
-            f"共 {total_hits} 次命中, "
-            f"已跟踪 {len(self._already_seen)} 个块"
-        )
-
-        return summary + "\n\n" + "\n\n---\n\n".join(parts)
-
-    @staticmethod
-    def _mmr_diversify(
-        results: List[dict], top_k: int, lambda_param: float = 0.7
-    ) -> List[dict]:
-        """
-        MMR 多样性去重 - 基于 Jaccard 相似度
-
-        在 token 集合上计算 Jaccard 相似度，避免返回内容高度重复的结果
-        """
-        def tokenize(text: str) -> Set[str]:
-            """简单分词：中文按字，英文按词"""
-            tokens: Set[str] = set()
-            # 英文单词
-            tokens.update(re.findall(r'[a-zA-Z]+', text.lower()))
-            # 中文字
-            tokens.update(re.findall(r'[\u4e00-\u9fff]', text))
-            return tokens
-
-        def jaccard(set_a: Set[str], set_b: Set[str]) -> float:
-            if not set_a or not set_b:
-                return 0.0
-            intersection = len(set_a & set_b)
-            union = len(set_a | set_b)
-            return intersection / union if union > 0 else 0.0
-
-        # 预计算 token 集合
-        token_sets = [tokenize(r["chunk"].content) for r in results]
-
-        # 按命中数排序作为相关性分数
-        relevance_scores = [
-            sum(r["hit_counts"].values()) for r in results
-        ]
-        max_rel = max(relevance_scores) if relevance_scores else 1
-        normalized_rel = [s / max_rel for s in relevance_scores]
-
-        selected_indices: List[int] = []
-        remaining = set(range(len(results)))
-
-        # 选择第一个（最高相关性）
-        if results:
-            best_idx = max(remaining, key=lambda i: normalized_rel[i])
-            selected_indices.append(best_idx)
-            remaining.remove(best_idx)
-
-        while remaining and len(selected_indices) < top_k:
-            best_mmr = -float("inf")
-            best_idx = -1
-
-            for i in remaining:
-                relevance = normalized_rel[i]
-                # 与已选结果的最大相似度
-                max_sim = 0.0
-                for si in selected_indices:
-                    sim = jaccard(token_sets[i], token_sets[si])
-                    max_sim = max(max_sim, sim)
-
-                mmr_score = lambda_param * relevance - (1 - lambda_param) * max_sim
-                if mmr_score > best_mmr:
-                    best_mmr = mmr_score
-                    best_idx = i
-
-            if best_idx >= 0:
-                selected_indices.append(best_idx)
-                remaining.remove(best_idx)
-            else:
-                break
-
-        return [results[i] for i in selected_indices]
+        return "\n\n---\n\n".join(parts)
 
 
 class ListKnowledgeChunksTool(Tool):
@@ -357,7 +233,6 @@ class ListKnowledgeChunksTool(Tool):
         parts = [f"文档 {doc_id} 共有 {len(chunks)} 个块：\n"]
         for chunk in chunks:
             preview = chunk.content[:100].replace("\n", " ")
-            parent_info = f" (父块: {chunk.parent_chunk_id})" if chunk.parent_chunk_id else ""
-            parts.append(f"  [{chunk.index}] {preview}... (tokens: {chunk.token_count}){parent_info}")
+            parts.append(f"  [{chunk.index}] {preview}... (tokens: {chunk.token_count})")
 
         return "\n".join(parts)

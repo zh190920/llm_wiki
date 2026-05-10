@@ -20,9 +20,6 @@ retriever:
   similarity_threshold: 0.5
   mmr_lambda: 0.7
   hybrid_alpha: 0.7
-  graph_enabled: false              # 是否启用图增强检索（需先构建知识图谱）
-  graph_alpha: 0.3                  # 图增强在RRF融合中的权重（0-1，与hybrid_alpha互补）
-  graph_max_related: 10             # 图增强检索最多返回的块数
 
 # 分块配置
 chunker:

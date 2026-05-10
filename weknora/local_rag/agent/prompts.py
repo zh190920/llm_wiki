@@ -1,30 +1,9 @@
 """
 Agent 提示词管理 - 动态构建系统提示词
-借鉴 WeKnora 的动态提示词构建设计，支持 PromptTemplateManager
+借鉴 WeKnora 的动态提示词构建设计
 """
-import os
 from typing import List, Optional
 
-# 延迟初始化的模板管理器
-_template_manager = None
-
-
-def _get_template_manager():
-    """获取或初始化提示词模板管理器"""
-    global _template_manager
-    if _template_manager is None:
-        from config.prompt_templates import PromptTemplateManager
-        templates_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "prompt_templates.yaml"
-        )
-        _template_manager = PromptTemplateManager(templates_path=templates_path)
-    return _template_manager
-
-
-# ============================================================
-# 保留原始硬编码模板作为后备（向后兼容）
-# ============================================================
 
 # Agent 系统提示词模板（RAG 模式，中文优化）
 AGENT_RAG_SYSTEM_PROMPT = """你是一个智能中文知识助手，拥有强大的推理和知识检索能力。
@@ -37,7 +16,7 @@ AGENT_RAG_SYSTEM_PROMPT = """你是一个智能中文知识助手，拥有强大
 2. **按需检索**：根据问题复杂度决定检索策略
 3. **多步推理**：对于复杂问题，分步检索、分析和综合
 4. **来源追溯**：回答时引用知识来源
-5. **适时终止**：收集到足够信息后，用 final_answer 提交答案
+5. **适时终止**：收集到足够信息后，**必须**用 final_answer 工具提交答案，不要继续检索
 
 ## 可用知识库
 {knowledge_bases}
@@ -47,7 +26,13 @@ AGENT_RAG_SYSTEM_PROMPT = """你是一个智能中文知识助手，拥有强大
 2. 使用 knowledge_search 搜索相关知识
 3. 如需更详细的信息，使用 grep_chunks 或 list_knowledge_chunks
 4. 如需查阅 Wiki 知识库，使用 wiki_read_page 或 wiki_search
-5. 综合分析所有信息，用 final_answer 提交答案
+5. 综合分析所有信息，**用 final_answer 提交最终答案**
+
+## ⚠️ 重要：何时使用 final_answer
+- 当你已经检索到足够的信息来回答用户问题时，立即使用 final_answer
+- 不要反复检索相同的内容
+- 不要在已有足够信息时继续调用其他工具
+- final_answer 的 answer 参数应该是一个完整、结构化的最终回答
 
 ## 重要提醒
 - 只基于检索到的信息回答，不要编造内容
@@ -83,59 +68,28 @@ def build_agent_system_prompt(
     动态构建 Agent 系统提示词
 
     借鉴 WeKnora 的提示词构建逻辑：
-    - 优先使用 PromptTemplateManager
-    - 如果模板不可用，回退到硬编码模板
     - 根据是否绑定知识库选择模板
     - 填充运行时信息
     """
-    # 尝试使用模板管理器
-    try:
-        manager = _get_template_manager()
-
-        if has_knowledge_base and knowledge_bases_info:
-            # 构建知识库信息
-            kb_parts = []
-            for kb in knowledge_bases_info:
-                name = kb.get("name", "未命名")
-                doc_count = kb.get("doc_count", 0)
-                chunk_count = kb.get("chunk_count", 0)
-                description = kb.get("description", "")
-                kb_parts.append(
-                    f"- **{name}**: {description} (文档数: {doc_count}, 块数: {chunk_count})"
-                )
-            kb_text = "\n".join(kb_parts) if kb_parts else "暂无可用知识库"
-
-            return manager.get_prompt(
-                "agent_rag",
-                knowledge_bases=kb_text,
-                current_time=current_time,
-                web_search_status="未启用",
+    if has_knowledge_base and knowledge_bases_info:
+        # 构建知识库信息
+        kb_parts = []
+        for kb in knowledge_bases_info:
+            name = kb.get("name", "未命名")
+            doc_count = kb.get("doc_count", 0)
+            chunk_count = kb.get("chunk_count", 0)
+            description = kb.get("description", "")
+            kb_parts.append(
+                f"- **{name}**: {description} (文档数: {doc_count}, 块数: {chunk_count})"
             )
-        else:
-            return manager.get_prompt(
-                "agent_pure",
-                current_time=current_time,
-            )
-    except Exception:
-        # 回退到硬编码模板
-        if has_knowledge_base and knowledge_bases_info:
-            kb_parts = []
-            for kb in knowledge_bases_info:
-                name = kb.get("name", "未命名")
-                doc_count = kb.get("doc_count", 0)
-                chunk_count = kb.get("chunk_count", 0)
-                description = kb.get("description", "")
-                kb_parts.append(
-                    f"- **{name}**: {description} (文档数: {doc_count}, 块数: {chunk_count})"
-                )
-            kb_text = "\n".join(kb_parts) if kb_parts else "暂无可用知识库"
+        kb_text = "\n".join(kb_parts) if kb_parts else "暂无可用知识库"
 
-            return AGENT_RAG_SYSTEM_PROMPT.format(
-                knowledge_bases=kb_text,
-                current_time=current_time,
-            )
-        else:
-            return AGENT_PURE_SYSTEM_PROMPT.format(current_time=current_time)
+        return AGENT_RAG_SYSTEM_PROMPT.format(
+            knowledge_bases=kb_text,
+            current_time=current_time,
+        )
+    else:
+        return AGENT_PURE_SYSTEM_PROMPT.format(current_time=current_time)
 
 
 # Wiki 相关提示词

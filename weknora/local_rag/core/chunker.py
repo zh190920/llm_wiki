@@ -46,7 +46,6 @@ class TextChunker:
         text: str,
         doc_id: str = "",
         file_type: str = "",
-        hierarchical: bool = False,
     ) -> List[Chunk]:
         """
         将文本分块
@@ -55,17 +54,12 @@ class TextChunker:
             text: 原始文本
             doc_id: 文档 ID
             file_type: 文件类型 (pdf/markdown)
-            hierarchical: 是否启用层级分块（父子块）
 
         Returns:
             分块列表
         """
         if not text.strip():
             return []
-
-        # 层级分块模式
-        if hierarchical or self.config.hierarchical:
-            return self.chunk_text_hierarchical(text, doc_id, file_type)
 
         # 根据文件类型选择分块策略
         if file_type == "markdown":
@@ -80,103 +74,6 @@ class TextChunker:
 
         logger.info(f"文本分块完成: doc_id={doc_id}, 总块数={len(chunks)}")
         return chunks
-
-    def chunk_text_hierarchical(
-        self,
-        text: str,
-        doc_id: str = "",
-        file_type: str = "",
-    ) -> List[Chunk]:
-        """
-        层级分块 - 先创建父块，再将父块拆分为子块
-
-        借鉴 WeKnora 的 Parent-Child Chunking 设计：
-        - 父块较大（如 2048 tokens），提供完整上下文
-        - 子块较小（如 512 tokens），作为精确检索单元
-        - 子块通过 parent_chunk_id 关联到父块
-        - 检索时命中子块，可回溯获取父块的完整上下文
-        """
-        parent_size = self.config.chunk_size_parent
-        child_size = self.config.chunk_size
-        child_overlap = self.config.chunk_overlap
-
-        # Step 1: 创建父块
-        if file_type == "markdown":
-            parent_texts = self._chunk_markdown(text, doc_id)
-        else:
-            parent_texts = self._chunk_fixed_size(text, doc_id)
-
-        # 如果父块太大，进一步切分
-        oversized_parents = []
-        for p in parent_texts:
-            if self.count_tokens(p.content) > parent_size:
-                sub_texts = self._split_fixed(p.content, parent_size, child_overlap)
-                for j, sub_text in enumerate(sub_texts):
-                    oversized_parents.append(Chunk(
-                        doc_id=doc_id,
-                        content=sub_text,
-                        metadata={**p.metadata, "sub_parent_index": j},
-                    ))
-            else:
-                oversized_parents.append(p)
-
-        parent_texts = oversized_parents
-
-        # Step 2: 将每个父块拆分为子块
-        all_chunks: List[Chunk] = []
-        chunk_index = 0
-
-        for parent_idx, parent_chunk in enumerate(parent_texts):
-            # 设置父块属性
-            parent_chunk.index = chunk_index
-            parent_chunk.token_count = self.count_tokens(parent_chunk.content)
-            parent_chunk.metadata["is_parent"] = True
-            parent_chunk.metadata["child_count"] = 0
-
-            parent_token_count = self.count_tokens(parent_chunk.content)
-
-            # 如果父块够小，不需要拆分，直接作为一个块（既是父也是子）
-            if parent_token_count <= child_size:
-                parent_chunk.metadata["is_parent"] = False
-                all_chunks.append(parent_chunk)
-                chunk_index += 1
-                continue
-
-            # 添加父块
-            all_chunks.append(parent_chunk)
-            parent_index = chunk_index
-            chunk_index += 1
-
-            # 拆分子块
-            child_texts = self._split_fixed(
-                parent_chunk.content, child_size, child_overlap
-            )
-
-            child_count = 0
-            for child_text in child_texts:
-                child_chunk = Chunk(
-                    doc_id=doc_id,
-                    content=child_text,
-                    parent_chunk_id=parent_chunk.chunk_id,
-                    metadata={
-                        **parent_chunk.metadata,
-                        "is_parent": False,
-                        "parent_index": parent_idx,
-                    },
-                )
-                child_chunk.index = chunk_index
-                child_chunk.token_count = self.count_tokens(child_text)
-                all_chunks.append(child_chunk)
-                chunk_index += 1
-                child_count += 1
-
-            parent_chunk.metadata["child_count"] = child_count
-
-        logger.info(
-            f"层级分块完成: doc_id={doc_id}, 总块数={len(all_chunks)}, "
-            f"父块数={sum(1 for c in all_chunks if c.metadata.get('is_parent'))}"
-        )
-        return all_chunks
 
     def _chunk_markdown(self, text: str, doc_id: str) -> List[Chunk]:
         """

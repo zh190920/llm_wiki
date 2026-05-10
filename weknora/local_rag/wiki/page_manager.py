@@ -118,12 +118,37 @@ class WikiPageManager:
             pages = [p for p in pages if p.status == status]
         return sorted(pages, key=lambda p: p.updated_at, reverse=True)
 
-    async def search_pages(self, query: str, top_k: int = 5) -> List[WikiPage]:
-        """搜索页面（标题 + 内容关键词匹配）"""
+    async def search_pages(
+        self,
+        query: str,
+        top_k: int = 5,
+        doc_ids: Optional[List[str]] = None,
+    ) -> List[WikiPage]:
+        """
+        搜索页面（标题 + 内容关键词匹配）
+
+        支持文档级预筛选：当指定 doc_ids 时，只搜索来自这些文档的 Wiki 页面。
+        这是"先确定检索手册范围，再在范围内检索"在 Wiki 模式中的实现。
+
+        Args:
+            query: 查询文本
+            top_k: 返回结果数
+            doc_ids: 限定搜索的文档 ID 列表（None 表示搜索所有页面）
+        """
         query_lower = query.lower()
+        doc_id_set = set(doc_ids) if doc_ids else None
         scored_pages: List[tuple[float, WikiPage]] = []
 
         for page in self._pages.values():
+            # 文档级预筛选：如果指定了 doc_ids，只搜索来自这些文档的页面
+            if doc_id_set is not None:
+                if not page.source_doc_ids:
+                    # 页面没有关联文档，跳过
+                    continue
+                # 检查页面的源文档是否与指定文档有交集
+                if not doc_id_set.intersection(set(page.source_doc_ids)):
+                    continue
+
             score = 0.0
             # 标题匹配（权重高）
             if query_lower in page.title.lower():

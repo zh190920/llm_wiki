@@ -33,9 +33,6 @@ class RetrieverConfig(BaseSettings):
     similarity_threshold: float = Field(default=0.5, description="相似度阈值")
     mmr_lambda: float = Field(default=0.7, description="MMR 多样性参数 (0=最大多样性, 1=最大相关性)")
     hybrid_alpha: float = Field(default=0.7, description="混合检索中向量检索权重")
-    graph_enabled: bool = Field(default=False, description="是否启用图增强检索（需先构建知识图谱）")
-    graph_alpha: float = Field(default=0.3, description="图增强检索在RRF融合中的权重")
-    graph_max_related: int = Field(default=10, description="图增强检索最多返回的块数")
 
 
 class ChunkerConfig(BaseSettings):
@@ -43,8 +40,6 @@ class ChunkerConfig(BaseSettings):
     chunk_size: int = Field(default=512, description="每个块的最大 token 数")
     chunk_overlap: int = Field(default=64, description="相邻块重叠 token 数")
     separator: str = Field(default="\n\n", description="分块分隔符")
-    hierarchical: bool = Field(default=False, description="是否启用层级分块（父子块）")
-    chunk_size_parent: int = Field(default=2048, description="父块的最大 token 数（层级分块时使用）")
 
 
 class AgentConfig(BaseSettings):
@@ -65,18 +60,6 @@ class WikiConfig(BaseSettings):
     wiki_dir: str = Field(default="./wiki_output", description="Wiki 输出目录")
 
 
-class MCPServerConfig(BaseSettings):
-    """MCP 服务器配置"""
-    name: str = Field(default="", description="MCP 服务器名称")
-    url: str = Field(default="", description="MCP 服务器 URL")
-    transport: str = Field(default="sse", description="传输协议: sse / http")
-
-
-class MCPConfig(BaseSettings):
-    """MCP 工具集成配置"""
-    servers: list = Field(default_factory=list, description="MCP 服务器列表")
-
-
 class AppConfig(BaseSettings):
     """应用全局配置"""
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -84,7 +67,6 @@ class AppConfig(BaseSettings):
     chunker: ChunkerConfig = Field(default_factory=ChunkerConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     wiki: WikiConfig = Field(default_factory=WikiConfig)
-    mcp: MCPConfig = Field(default_factory=MCPConfig)
 
     # 数据存储
     data_dir: str = Field(default="./data", description="数据存储目录")
