@@ -54,8 +54,8 @@ class PDFParser(BaseParser):
 
     def _parse_sync(self, file_path: str) -> str:
         """同步解析 PDF（在线程池中执行）"""
-        import fitz  # pymupdf
-
+        # import fitz  # pymupdf
+        import pymupdf as fitz
         doc = fitz.open(file_path)
         pages_text = []
 

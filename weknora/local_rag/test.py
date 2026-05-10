@@ -33,7 +33,8 @@ qa = LocalQA(
 
 # 第二步：使用图谱增强检索的问答
 # use_graph=True 启用三源RRF融合（向量+关键词+图谱）
-answer = qa.ask("xxx", use_graph=False, deep=True)
+answer = qa.ask("", use_graph=False, deep=True)
+# answer = qa.ask_agent("xxx")
 print(answer)
 
 # 深度模式 + 图谱增强
