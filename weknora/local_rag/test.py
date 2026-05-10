@@ -17,7 +17,7 @@ qa = LocalQA(
 
 # 加载文档
 # qa.load_file("操作手册.pdf")
-qa.load_directory(r"E:\vs_git\manual")
+# qa.load_directory(r"E:\vs_git\manual")
 
 # 设置别名
 # qa._doc_router.set_aliases({

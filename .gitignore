@@ -53,3 +53,4 @@ server.log
 # Skills directory
 skills/
 rag_workspace/
+local_qa_data/

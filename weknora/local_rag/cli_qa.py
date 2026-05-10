@@ -577,7 +577,7 @@ class LocalQA:
             directory: 保存目录（默认使用初始化时的 data_dir）
         """
         save_dir = directory or self._data_dir
-        asyncio.get_event_loop().run_until_complete(self._save_state_async(save_dir))
+        asyncio.get_event_loop().run_until_complete(self._save_graph_data(save_dir))
 
     def load(self, directory: Optional[str] = None):
         """
@@ -588,6 +588,21 @@ class LocalQA:
         """
         load_dir = directory or self._data_dir
         asyncio.get_event_loop().run_until_complete(self._restore_state_async(load_dir))
+
+    async def _save_graph_data(self, directory: Optional[str] = None):
+        """
+        异步保存知识图谱数据到磁盘
+
+        Args:
+            directory: 保存目录（默认使用 data_dir/knowledge_graph）
+        """
+
+        if self._graph_builder and self._graph_builder.has_data:
+            save_dir = Path(directory or self._data_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            graph_dir = save_dir / "knowledge_graph"
+            self._graph_builder.save(str(graph_dir))
+            logger.info(f"知识图谱已保存到 {graph_dir}")
 
     async def _save_state_async(self, directory: Optional[str] = None):
         """
@@ -603,37 +618,37 @@ class LocalQA:
         save_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # # 1. 保存向量索引
-            # vs_dir = save_dir / "vector_store"
-            # vs_dir.mkdir(parents=True, exist_ok=True)
-            # await self._vector_store.save(str(vs_dir))
+            # 1. 保存向量索引
+            vs_dir = save_dir / "vector_store"
+            vs_dir.mkdir(parents=True, exist_ok=True)
+            await self._vector_store.save(str(vs_dir))
 
-            # # 2. 保存文档元数据
-            # docs_data = {}
-            # for doc_id, meta in self._documents.items():
-            #     docs_data[doc_id] = meta.model_dump()
-            # docs_path = save_dir / "documents.json"
-            # with open(docs_path, "w", encoding="utf-8") as f:
-            #     json.dump(docs_data, f, ensure_ascii=False, indent=2)
+            # 2. 保存文档元数据
+            docs_data = {}
+            for doc_id, meta in self._documents.items():
+                docs_data[doc_id] = meta.model_dump()
+            docs_path = save_dir / "documents.json"
+            with open(docs_path, "w", encoding="utf-8") as f:
+                json.dump(docs_data, f, ensure_ascii=False, indent=2)
 
-            # # 3. 保存文档路由注册表
-            # router_data = {}
-            # for doc_id, info in self._doc_router._docs.items():
-            #     router_data[doc_id] = {
-            #         "doc_id": info.doc_id,
-            #         "filename": info.filename,
-            #         "title": info.title,
-            #         "keywords": info.keywords,
-            #         "metadata": info.metadata,
-            #     }
-            # router_path = save_dir / "doc_router.json"
-            # with open(router_path, "w", encoding="utf-8") as f:
-            #     json.dump(router_data, f, ensure_ascii=False, indent=2)
+            # 3. 保存文档路由注册表
+            router_data = {}
+            for doc_id, info in self._doc_router._docs.items():
+                router_data[doc_id] = {
+                    "doc_id": info.doc_id,
+                    "filename": info.filename,
+                    "title": info.title,
+                    "keywords": info.keywords,
+                    "metadata": info.metadata,
+                }
+            router_path = save_dir / "doc_router.json"
+            with open(router_path, "w", encoding="utf-8") as f:
+                json.dump(router_data, f, ensure_ascii=False, indent=2)
 
-            # # 4. 保存对话历史
-            # history_path = save_dir / "conversation_history.json"
-            # with open(history_path, "w", encoding="utf-8") as f:
-            #     json.dump(self._conversation_history, f, ensure_ascii=False, indent=2)
+            # 4. 保存对话历史
+            history_path = save_dir / "conversation_history.json"
+            with open(history_path, "w", encoding="utf-8") as f:
+                json.dump(self._conversation_history, f, ensure_ascii=False, indent=2)
 
             # 5. 保存知识图谱数据（如果已构建）
             if self._graph_builder and self._graph_builder.has_data:
